@@ -242,6 +242,28 @@ class ResultWindow(QWidget):
         self._text_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self._text_view, stretch=1)
 
+        # ---- 语音识别区 ----
+        self._speech_status = QLabel("")
+        self._speech_status.setFont(QFont("Microsoft YaHei", 10))
+        self._speech_status.setStyleSheet("color: #88cc88; padding: 0 4px;")
+        self._speech_status.hide()
+        layout.addWidget(self._speech_status)
+
+        self._speech_text = QTextEdit()
+        self._speech_text.setReadOnly(True)
+        self._speech_text.setFixedHeight(80)
+        self._speech_text.setFont(QFont("Microsoft YaHei", 11))
+        self._speech_text.setStyleSheet("""
+            QTextEdit {
+                background: #1a2a1a; color: #ccddcc; border: 1px solid #2a4a2a;
+                border-radius: 4px; padding: 4px 8px;
+            }
+        """)
+        self._speech_text.hide()
+        self._speech_sentences = []
+        self._speech_selected = -1
+        layout.addWidget(self._speech_text)
+
         # ---- 待发送图片缩略图区 ----
         from PyQt6.QtWidgets import QScrollArea, QSizePolicy
 
@@ -473,6 +495,47 @@ class ResultWindow(QWidget):
     def get_content(self) -> str:
         return self._buffer
 
+    # ---- 语音识别 ----
+
+    def set_speech_status(self, text: str):
+        """显示/隐藏语音状态。"""
+        self._speech_status.setText(text)
+        self._speech_status.setVisible(bool(text))
+
+    def set_speech_sentences(self, sentences: list):
+        """更新语音识别句子列表。"""
+        self._speech_sentences = list(sentences)
+        self._speech_text.show()
+        self._speech_status.setText(f"🎤 已识别 {len(sentences)} 句 (滚轮选择, Ctrl+Enter 提问)")
+        self._refresh_speech_display()
+
+    def get_speech_selected(self) -> str:
+        """获取当前选中的句子。"""
+        if 0 <= self._speech_selected < len(self._speech_sentences):
+            return self._speech_sentences[self._speech_selected]
+        return ""
+
+    def wheelEvent(self, event):
+        """滚轮选择语音识别句子。"""
+        if self._speech_sentences and self._speech_text.isVisible():
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self._speech_selected = max(0, self._speech_selected - 1)
+            elif delta < 0:
+                self._speech_selected = min(len(self._speech_sentences) - 1, self._speech_selected + 1)
+            self._refresh_speech_display()
+        super().wheelEvent(event)
+
+    def _refresh_speech_display(self):
+        """刷新语音句子显示（高亮选中句）。"""
+        html = ""
+        for i, s in enumerate(self._speech_sentences):
+            if i == self._speech_selected:
+                html += f"<span style='background:#3a6a3a;color:#fff;padding:1px 4px;'>▶ {s}</span> "
+            else:
+                html += f"<span style='color:#99bb99;'>{s}</span> "
+        self._speech_text.setHtml(html)
+
     # ---- 追问 ----
 
     def get_input_text(self) -> str:
@@ -606,9 +669,20 @@ class ResultWindow(QWidget):
         self._copy_btn.hide()
 
     def _send_follow_up(self):
-        """用户按 Enter 或点击发送按钮时触发。"""
+        """用户按 Enter 或点击发送按钮时触发。Ctrl+Enter → 发送语音句子。"""
+        from PyQt6.QtWidgets import QApplication
+        ctrl_held = QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
+
+        if ctrl_held and self._speech_sentences:
+            # Ctrl+Enter → 发送选中的语音句子
+            selected = self.get_speech_selected()
+            if selected:
+                self._ask_input.setText(selected)
+                self._ask_input.clear()
+                self.follow_up_requested.emit(selected)
+                return
+
         text = self._ask_input.text().strip()
-        # 有文字或有待发送图片都可发送
         if text or self._pending_images:
             self._ask_input.clear()
             self.follow_up_requested.emit(text)

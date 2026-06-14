@@ -39,6 +39,7 @@ from config import (
 from utils.image_tool import qimage_to_pil, pil_to_base64, compress_image
 from utils.context_store import load_context, save_context
 from utils.ocr_tool import ocr_recognize_batch
+from utils.speech_worker import get_speech_worker
 from utils.user_manager import (
     user_id_from_key, new_conversation, save_conversation,
     load_conversation, list_conversations, delete_conversation,
@@ -287,6 +288,7 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+d': self._on_hotkey_triggered,
                 '<ctrl>+f': self._on_hotkey_toggle,
                 '<ctrl>+r': self._on_ocr_hotkey,
+                '<ctrl>+y': self._on_speech_hotkey,
                 '<ctrl>+q': self._on_quit_hotkey,
             }
             self._hotkey_listener = pynput_keyboard.GlobalHotKeys(
@@ -492,12 +494,17 @@ class ScreenAIAgent(QObject):
         self._last_image_b64_list = self._result_window.get_pending_images()
         self._result_window.clear_pending_images()
 
+        # 检查是否来自语音查询（Ctrl+Enter）
+        speech_selected = self._result_window.get_speech_selected()
+        if speech_selected and text == speech_selected:
+            # 语音查询：加精简要回答提示
+            text = f"以下是一段语音转文字的内容，请挑重点简要回答其中的问题：\n\n{text}"
+
         # 如果无文字也无图片，不发送
         if not text.strip() and not self._last_image_b64_list:
             return
 
         self._last_user_text = text
-        # 清空输入框
         self._result_window.clear_input()
         self._run_ai_stream(text, image_base64_list=self._last_image_b64_list)
 
@@ -581,6 +588,37 @@ class ScreenAIAgent(QObject):
     def _on_quit_hotkey(self, key=None):
         """Ctrl+Q → 退出程序。"""
         QTimer.singleShot(0, self._quit_app)
+
+    def _on_speech_hotkey(self, key=None):
+        """Ctrl+Y → 开始/停止语音识别。"""
+        QTimer.singleShot(0, self._toggle_speech)
+
+    def _toggle_speech(self):
+        """切换语音识别开关。"""
+        worker = get_speech_worker()
+        if worker.is_running():
+            worker.stop()
+            self._result_window.set_speech_status("")
+            self._tray.showMessage("Ai_Flow", "语音识别已停止", QSystemTrayIcon.MessageIcon.Information, 1500)
+        else:
+            worker.clear()
+            worker.set_callbacks(
+                on_sentence=lambda text, all_s: QTimer.singleShot(0, lambda: self._on_speech_sentence(text, all_s)),
+                on_error=lambda err: QTimer.singleShot(0, lambda: self._on_speech_error(err)),
+            )
+            worker.start()
+            self._result_window.set_speech_status("🎤 正在听...")
+            self._result_window.show()
+            self._result_window.raise_()
+            self._tray.showMessage("Ai_Flow", "语音识别已启动\nCtrl+Y 停止 | 滚轮选句子 | Ctrl+Enter 提问", QSystemTrayIcon.MessageIcon.Information, 2000)
+
+    def _on_speech_sentence(self, text: str, all_sentences: list):
+        """新句子识别完成 → 更新显示。"""
+        self._result_window.set_speech_sentences(all_sentences)
+
+    def _on_speech_error(self, err: str):
+        print(f"[Speech] 错误: {err}")
+        self._result_window.set_speech_status(f"❌ {err}")
 
     def _refresh_sidebar(self):
         convs = list_conversations(self._user_id)

@@ -664,12 +664,20 @@ class ScreenAIAgent(QObject):
 
                     proc.wait()
 
-                    # 读结果
+                    # 读结果（等文件写入完成）
+                    time_waited = 0
+                    while not os.path.exists(result_file) and time_waited < 5:
+                        self.msleep(200)
+                        time_waited += 0.2
+
                     if os.path.exists(result_file):
-                        with open(result_file, "r", encoding="utf-8") as f:
-                            result = json.load(f)
+                        try:
+                            with open(result_file, "r", encoding="utf-8") as f:
+                                result = json.load(f)
+                        except json.JSONDecodeError:
+                            result = {"success": False, "message": "结果文件损坏"}
                     else:
-                        result = {"success": False, "message": "进程异常退出"}
+                        result = {"success": False, "message": f"进程退出(code={proc.returncode})，无结果文件"}
 
                     msg = result.get("message", "")
                     steps = result.get("steps_done", "")

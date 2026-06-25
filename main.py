@@ -633,7 +633,7 @@ class ScreenAIAgent(QObject):
             def run(self):
                 try:
                     result = run_gui_task(
-                        task=self._task, use_browser=True,
+                        task=self._task, use_browser=False,
                         progress_callback=lambda msg: self.progress.emit(msg),
                     )
                     msg = result.get("message", "")

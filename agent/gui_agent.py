@@ -134,16 +134,13 @@ EXECUTOR_PROMPT = """你是一个精确的屏幕操作执行器。我会给你�
 def _screenshot_pil() -> Image.Image:
     """截取全屏，返回 PIL Image。"""
     from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtGui import QImage
     app = QApplication.instance()
     if app:
         screen = app.primaryScreen()
         if screen:
             pixmap = screen.grabWindow(0)
-            img = pixmap.toImage()
-            buf = QImage(img)
             byte_arr = io.BytesIO()
-            buf.save(byte_arr, "PNG")
+            pixmap.save(byte_arr, "PNG")
             return Image.open(byte_arr)
 
     # 回退：pyautogui

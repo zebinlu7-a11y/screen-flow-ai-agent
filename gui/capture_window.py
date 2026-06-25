@@ -100,6 +100,7 @@ class CaptureWindow(QWidget):
                 # 绿色边框
                 p.setPen(QPen(QColor(0, 200, 80), 2))
                 p.setBrush(Qt.BrushStyle.NoBrush)
+                
                 p.drawRect(rect)
                 # 编号
                 label = str(i + 1)

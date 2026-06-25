@@ -229,6 +229,8 @@ class ResultWindow(QWidget):
             Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         self._text_view.setFont(QFont("Microsoft YaHei", RESULT_FONT_SIZE))
+        # 不显示 I 型光标
+        self._text_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self._text_view.setStyleSheet("""
             QTextEdit {
                 background-color: transparent;
@@ -243,11 +245,29 @@ class ResultWindow(QWidget):
         layout.addWidget(self._text_view, stretch=1)
 
         # ---- 语音识别区 ----
+        # 语音状态行：状态文字 + 发送按钮
+        speech_bar = QHBoxLayout()
+        speech_bar.setContentsMargins(0, 0, 0, 0)
+        speech_bar.setSpacing(4)
+
         self._speech_status = QLabel("")
         self._speech_status.setFont(QFont("Microsoft YaHei", 10))
         self._speech_status.setStyleSheet("color: #88cc88; padding: 0 4px;")
         self._speech_status.hide()
-        layout.addWidget(self._speech_status)
+        speech_bar.addWidget(self._speech_status)
+        speech_bar.addStretch()
+
+        self._speech_send_btn = QPushButton("📤 发送选中句")
+        self._speech_send_btn.setFixedHeight(24)
+        self._speech_send_btn.setStyleSheet("""
+            QPushButton { background: #2b5db8; color: white; border: none;
+                border-radius: 4px; padding: 2px 10px; font-size: 10px; }
+            QPushButton:hover { background: #3a6fd8; }
+        """)
+        self._speech_send_btn.clicked.connect(self._send_speech_selected)
+        self._speech_send_btn.hide()
+        speech_bar.addWidget(self._speech_send_btn)
+        layout.addLayout(speech_bar)
 
         self._speech_text = QTextEdit()
         self._speech_text.setReadOnly(True)
@@ -325,7 +345,7 @@ class ResultWindow(QWidget):
             }
             QLineEdit:focus { border-color: #4a8af4; }
         """)
-        self._ask_input.returnPressed.connect(self._send_follow_up)
+        self._ask_input.returnPressed.connect(self._on_input_return)
         ask_layout.addWidget(self._ask_input, stretch=1)
 
         # ---- 模型选择器 ----
@@ -501,6 +521,7 @@ class ResultWindow(QWidget):
         """显示/隐藏语音状态。"""
         self._speech_status.setText(text)
         self._speech_status.setVisible(bool(text))
+        self._speech_send_btn.setVisible(bool(text))
 
     def set_speech_sentences(self, sentences: list):
         """更新语音识别句子列表。"""
@@ -527,18 +548,28 @@ class ResultWindow(QWidget):
         super().wheelEvent(event)
 
     def _refresh_speech_display(self):
-        """刷新语音句子显示（高亮选中句）。"""
+        """刷新语音句子显示（编号 + 高亮选中句）。"""
         html = ""
         for i, s in enumerate(self._speech_sentences):
+            num = i + 1
             if i == self._speech_selected:
-                html += f"<span style='background:#3a6a3a;color:#fff;padding:1px 4px;'>▶ {s}</span> "
+                html += (
+                    f"<div style='background:#3a5a3a;color:#fff;padding:3px 6px;"
+                    f"border-radius:4px;margin:2px 0;'>"
+                    f"<b>▶ [{num}]</b> {s}</div>"
+                )
             else:
-                html += f"<span style='color:#99bb99;'>{s}</span> "
+                html += (
+                    f"<div style='color:#99bb99;padding:2px 6px;margin:1px 0;'>"
+                    f"<b>[{num}]</b> {s}</div>"
+                )
         self._speech_text.setHtml(html)
+        # 自动滚到底部
+        vsb = self._speech_text.verticalScrollBar()
+        if vsb:
+            vsb.setValue(vsb.maximum())
 
     # ---- 追问 ----
-
-    def get_input_text(self) -> str:
         """获取底部追问输入框当前文本。"""
         return self._ask_input.text().strip()
 
@@ -668,20 +699,20 @@ class ResultWindow(QWidget):
         self._thumb_scroll.hide()
         self._copy_btn.hide()
 
+    def _on_input_return(self):
+        """Enter 发送文字（Ctrl+Enter 由 keyPressEvent 拦截）。"""
+        self._send_follow_up()
+
+    def _send_speech_selected(self):
+        """发送选中的语音句子到 AI。"""
+        selected = self.get_speech_selected()
+        if selected:
+            self._ask_input.setText(selected)
+            self.follow_up_requested.emit(selected)
+            self._ask_input.clear()
+
     def _send_follow_up(self):
-        """用户按 Enter 或点击发送按钮时触发。Ctrl+Enter → 发送语音句子。"""
-        from PyQt6.QtWidgets import QApplication
-        ctrl_held = QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
-
-        if ctrl_held and self._speech_sentences:
-            # Ctrl+Enter → 发送选中的语音句子
-            selected = self.get_speech_selected()
-            if selected:
-                self._ask_input.setText(selected)
-                self._ask_input.clear()
-                self.follow_up_requested.emit(selected)
-                return
-
+        """用户点发送按钮时触发。"""
         text = self._ask_input.text().strip()
         if text or self._pending_images:
             self._ask_input.clear()
@@ -966,24 +997,35 @@ class ResultWindow(QWidget):
         self.setGeometry(geo)
 
     def showEvent(self, event):
-        """窗口显示时：隐藏任务栏图标 + 防屏幕捕获。"""
+        """窗口显示时：隐藏任务栏图标 + 可选防屏幕捕获。"""
         super().showEvent(event)
         if not self._win_hidden_done and self.winId():
             self._win_hidden_done = True
             try:
                 import ctypes
-                from PyQt6.QtCore import QTimer
                 hwnd = int(self.winId())
                 # 从任务栏隐藏
                 ctypes.windll.user32.SetWindowLongPtrW(hwnd, -20,
                     ctypes.windll.user32.GetWindowLongPtrW(hwnd, -20) | 0x80)
-                # 防止被腾讯会议等屏幕共享捕获（Win10 2004+）
-                try:
-                    ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
-                except Exception:
-                    pass
+                # 防屏幕捕获（默认开启，右键托盘可切换）
+                self._privacy_enabled = True
             except Exception:
                 pass
+
+    def toggle_privacy(self, enabled: bool = True):
+        """切换防屏幕捕获开关。True=会议看不到，False=可以看到。"""
+        if not self.winId():
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            self._privacy_enabled = enabled
+            if enabled:
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
+            else:
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         """拦截关闭事件：只隐藏窗口不退出程序。"""

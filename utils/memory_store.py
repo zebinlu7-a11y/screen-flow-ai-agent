@@ -152,33 +152,68 @@ def merge_facts(existing: List[dict], new_facts: List[dict]) -> List[dict]:
         if not is_dup:
             result.append(nf)
     # 保留最近50条事实
-    return result[-50:]
+    result = result[-50:]
+    # 同步到 FAISS
+    sync_facts_to_vector(result)
+    return result
 
 
 def search_facts(query: str, facts: List[dict], top_k: int = 5) -> List[dict]:
-    """关键词检索相关事实，返回 top_k 条。"""
+    """
+    FAISS 语义检索相关事实，返回 top_k 条。
+    回退到关键词匹配如果向量库不可用。
+    """
     if not query or not facts:
         return []
 
-    keywords = set(_extract_keywords(query))
+    # 尝试 FAISS 语义搜索
+    try:
+        from utils.vector_store import get_memory_vector_store
+        store = get_memory_vector_store()
+        results = store.search(query, top_k)
+        if results:
+            # 将 FAISS 结果映射回 facts
+            fact_map = {f.get("content", ""): f for f in facts}
+            matched = []
+            for _, text, score in results:
+                for f in facts:
+                    if f.get("content", "") == text:
+                        matched.append(f)
+                        break
+            if matched:
+                return matched
+    except Exception as e:
+        print(f"[Memory] FAISS 搜索失败，回退关键词: {e}")
+
+    # 回退：关键词匹配
+    keywords = set(re.findall(r'[一-鿿]{2,4}', query))
+    stop_words = set("的了吗呢啊这个是哪个有什么可以能不能怎么为什么".split())
+    keywords = {w for w in keywords if w not in stop_words}
+
     scored = []
     for f in facts:
         content = f.get("content", "")
         score = sum(1 for kw in keywords if kw in content)
         if score > 0:
             scored.append((score, f))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return [f for _, f in scored[:top_k]]
 
 
-def _extract_keywords(text: str) -> List[str]:
-    """提取关键中文词。"""
-    words = re.findall(r'[一-鿿]{2,4}', text)
-    return [w for w in words if w not in _STOP_WORDS][:15]
-
-
-_STOP_WORDS = set("的了吗呢啊这个是哪个有什么可以能不能怎么为什么".split())
+def sync_facts_to_vector(facts: List[dict]):
+    """将事实同步到 FAISS 向量库。"""
+    if not facts:
+        return
+    try:
+        from utils.vector_store import get_memory_vector_store
+        store = get_memory_vector_store()
+        store.clear()
+        texts = [f.get("content", "") for f in facts]
+        ids = [f.get("id", str(i)) for i, f in enumerate(facts)]
+        store.add(texts, ids)
+        print(f"[Memory] FAISS 同步完成: {len(texts)} 条事实")
+    except Exception as e:
+        print(f"[Memory] FAISS 同步失败: {e}")
 
 
 # ============================================================

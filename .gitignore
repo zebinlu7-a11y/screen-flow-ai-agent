@@ -36,3 +36,4 @@ Thumbs.db
 # PyInstaller
 *.manifest
 dist_new/
+dist_final/

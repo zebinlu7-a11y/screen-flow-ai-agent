@@ -86,6 +86,7 @@ class StreamWorker(QThread):
                     messages=self._messages,
                     user_text=self._user_text,
                     image_base64_list=self._image_base64_list,
+                    user_id=self._user_id,
                 ):
                     self.token_received.emit(token)
 
@@ -215,6 +216,14 @@ class ScreenAIAgent(QObject):
 
         menu.addSeparator()
 
+        self._privacy_action = QAction("👁️ 屏幕共享可见 (当前: 隐藏)")
+        self._privacy_action.setCheckable(True)
+        self._privacy_action.setChecked(False)
+        self._privacy_action.triggered.connect(self._toggle_privacy)
+        menu.addAction(self._privacy_action)
+
+        menu.addSeparator()
+
         quit_action = QAction("❌ 退出")
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(quit_action)
@@ -260,6 +269,15 @@ class ScreenAIAgent(QObject):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._start_capture_flow()
 
+    def _toggle_privacy(self, checked: bool):
+        """切换防屏幕捕获：checked=True → 会议可见"""
+        if checked:
+            self._result_window.toggle_privacy(False)
+            self._privacy_action.setText("👁️ 屏幕共享可见 (当前: 可见)")
+        else:
+            self._result_window.toggle_privacy(True)
+            self._privacy_action.setText("👁️ 屏幕共享可见 (当前: 隐藏)")
+
     def _quit_app(self):
         """退出程序 — 保存对话 + 提取记忆。"""
         print("[AIRAG] 正在退出...")
@@ -289,6 +307,7 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+f': self._on_hotkey_toggle,
                 '<ctrl>+r': self._on_ocr_hotkey,
                 '<ctrl>+y': self._on_speech_hotkey,
+                '<ctrl>+g': self._on_gui_agent_hotkey,
                 '<ctrl>+q': self._on_quit_hotkey,
             }
             self._hotkey_listener = pynput_keyboard.GlobalHotKeys(
@@ -593,19 +612,53 @@ class ScreenAIAgent(QObject):
         """Ctrl+Y → 开始/停止语音识别。"""
         QTimer.singleShot(0, self._toggle_speech)
 
+    def _on_gui_agent_hotkey(self, key=None):
+        """Ctrl+G → GUI Agent 自动化操作。"""
+        QTimer.singleShot(0, self._start_gui_agent)
+
+    def _start_gui_agent(self):
+        """打开 GUI Agent 命令面板。"""
+        from gui.gui_agent_panel import GuiAgentDialog
+        from agent.gui_agent import run_gui_task
+
+        dlg = GuiAgentDialog()
+
+        def on_submit(task: str):
+            # 在后台线程执行，避免阻塞 UI
+            import threading
+
+            def run():
+                try:
+                    result = run_gui_task(
+                        task=task,
+                        progress_callback=lambda msg: dlg.set_progress(msg),
+                    )
+                    dlg.set_done(result.success, result.message)
+                except Exception as e:
+                    dlg.set_done(False, f"执行异常: {e}")
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+
+        dlg.task_submitted.connect(on_submit)
+        dlg.exec()
+
     def _toggle_speech(self):
         """切换语音识别开关。"""
         worker = get_speech_worker()
         if worker.is_running():
             worker.stop()
+            try:
+                worker.signal.sentence_ready.disconnect(self._on_speech_sentence)
+                worker.signal.error_occurred.disconnect(self._on_speech_error)
+            except Exception:
+                pass
             self._result_window.set_speech_status("")
             self._tray.showMessage("Ai_Flow", "语音识别已停止", QSystemTrayIcon.MessageIcon.Information, 1500)
         else:
             worker.clear()
-            worker.set_callbacks(
-                on_sentence=lambda text, all_s: QTimer.singleShot(0, lambda: self._on_speech_sentence(text, all_s)),
-                on_error=lambda err: QTimer.singleShot(0, lambda: self._on_speech_error(err)),
-            )
+            worker.signal.sentence_ready.connect(self._on_speech_sentence)
+            worker.signal.error_occurred.connect(self._on_speech_error)
             worker.start()
             self._result_window.set_speech_status("🎤 正在听...")
             self._result_window.show()
@@ -613,8 +666,9 @@ class ScreenAIAgent(QObject):
             self._tray.showMessage("Ai_Flow", "语音识别已启动\nCtrl+Y 停止 | 滚轮选句子 | Ctrl+Enter 提问", QSystemTrayIcon.MessageIcon.Information, 2000)
 
     def _on_speech_sentence(self, text: str, all_sentences: list):
-        """新句子识别完成 → 更新显示。"""
-        self._result_window.set_speech_sentences(all_sentences)
+        """新句子识别完成 → pyqtSignal 已切回主线程，直接更新 UI。"""
+        if text:  # 只有非空文本才更新
+            self._result_window.set_speech_sentences(all_sentences)
 
     def _on_speech_error(self, err: str):
         print(f"[Speech] 错误: {err}")

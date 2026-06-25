@@ -230,7 +230,7 @@ class BrowserMCP:
 # Vision Engine (豆包 VL 截图定位)
 # ============================================================
 
-VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确坐标。
+VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确中心坐标。
 
 用户指令: {task}
 
@@ -393,9 +393,7 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
 
 def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                  use_browser: bool = True,
-                 progress: Callable = None,
-                 hide_window: Callable = None,
-                 show_window: Callable = None) -> bool:
+                 progress: Callable = None) -> bool:
     """
     执行单个步骤。双引擎决策：
     1. Playwright MCP (不影响鼠标，无干扰)
@@ -456,11 +454,7 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         except Exception as e:
             print(f"[Exec] Playwright 异常: {e}")
 
-    # ===== 引擎 2: 视觉 + pyautogui（隐藏 Ai_Flow 窗口避免遮挡）=====
-    if hide_window:
-        hide_window()
-        time.sleep(0.3)
-
+    # ===== 引擎 2: 视觉 + pyautogui（Ai_Flow窗口有防捕获保护，不需要隐藏）=====
     try:
         img = _screenshot_desktop()
         if mcp and mcp.connected:
@@ -469,12 +463,9 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                 img = page_img
 
         pos = vision_locate(desc, img)
-        if show_window:
-            show_window()
 
         if pos and pos.get("found"):
             x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
-            # 用真实屏幕分辨率做坐标映射（不写死 1920×1080）
             import pyautogui
             real_w, real_h = pyautogui.size()
             img_w, img_h = img.size
@@ -489,8 +480,6 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         print(f"[Exec] Vision 未找到: {desc}")
     except Exception as e:
         print(f"[Exec] Vision 异常: {e}")
-        if show_window:
-            show_window()
 
     return False
 
@@ -555,11 +544,9 @@ def audit_result(task: str, image: Image.Image,
 # ============================================================
 
 def run_gui_task(task: str,
-                 use_browser: bool = False,  # Playwright 与 Qt asyncio 冲突，默认用视觉
+                 use_browser: bool = False,
                  steps: List[dict] = None,
-                 progress_callback: Callable = None,
-                 hide_window: Callable = None,
-                 show_window: Callable = None) -> dict:
+                 progress_callback: Callable = None) -> dict:
     """完整 RPA 流水线。"""
     mcp = None
     if use_browser:
@@ -583,8 +570,7 @@ def run_gui_task(task: str,
         desc = step.get("desc", step.get("target", ""))
         if progress_callback:
             progress_callback(f"[{i+1}/{total}] {desc}")
-        success = execute_step(step, mcp, use_browser, None,
-                               hide_window, show_window)
+        success = execute_step(step, mcp, use_browser, None)
         if success:
             ok += 1
             if progress_callback:

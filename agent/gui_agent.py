@@ -35,8 +35,16 @@ class BrowserMCP:
 
     @staticmethod
     def launch_browser(port: int = 9222) -> bool:
-        """自动找到 Edge/Chrome 并带 CDP 端口启动。"""
+        """自动找到 Edge/Chrome 并带 CDP 端口启动。先关闭已有进程确保 CDP 生效。"""
         import subprocess
+        # 先关闭所有 Edge 进程（否则 CDP 端口不生效）
+        try:
+            subprocess.run(["taskkill", "/f", "/im", "msedge.exe"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+        except Exception:
+            pass
+
         paths = [
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -50,7 +58,7 @@ class BrowserMCP:
                                       "--new-window", "--start-maximized", "about:blank"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     print(f"[MCP] 已启动浏览器: {p}")
-                    time.sleep(2)
+                    time.sleep(3)
                     return True
                 except Exception as e:
                     print(f"[MCP] 启动失败: {e}")

@@ -83,25 +83,35 @@ def analyze_task(task: str, model_name: str = "doubao-seed-2-0-lite-260428") -> 
         response = llm.invoke([HumanMessage(content=prompt)])
         text = response.content if hasattr(response, 'content') else ""
 
-        # 提取 JSON
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(text[start:end])
-            steps = []
-            for s in data.get("steps", []):
-                steps.append(ActionStep(
-                    step_id=s.get("step_id", len(steps) + 1),
-                    description=s.get("description", ""),
-                    action_type=s.get("action_type", "click"),
-                    target=s.get("target", ""),
-                    value=s.get("value", ""),
-                ))
-            return steps
-    except Exception as e:
-        print(f"[Analyzer] 任务分解失败: {e}")
+        # 提取 JSON（支持 markdown code block）
+        import re as _re
+        # 先取 ```json ... ``` 代码块
+        m = _re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+        if m:
+            text = m.group(1)
+        else:
+            # 直接找第一个 { 到最后一个 }
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                text = text[start:end]
 
-    # 回退：单步执行
+        data = json.loads(text)
+        steps = []
+        raw_steps = data.get("steps", data.get("actions", data.get("operations", [])))
+        for i, s in enumerate(raw_steps, 1):
+            steps.append(ActionStep(
+                step_id=s.get("step_id", s.get("id", i)),
+                description=s.get("description", s.get("desc", s.get("action", ""))),
+                action_type=s.get("action_type", s.get("type", "click")),
+                target=s.get("target", s.get("element", s.get("目标", ""))),
+                value=s.get("value", s.get("text", s.get("content", ""))),
+            ))
+        return steps
+    except Exception as e:
+        print(f"[Analyzer] 解析失败: {e}\n原始输出: {text[:500]}")
+
+    # 回退：整个任务作为单步
     return [ActionStep(
         step_id=1, description=task,
         action_type="screenshot", target="", value=""

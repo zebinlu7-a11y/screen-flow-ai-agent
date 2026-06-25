@@ -80,9 +80,12 @@ class BrowserMCP:
             self._connected = bool(self._page)
             if self._connected:
                 print(f"[MCP] ✅ 已连接: {self._page.title()}")
-                # 最大化
+                # 最大化以确保窗口可见并可截图
                 try:
                     self._page.evaluate("() => { moveTo(0,0); resizeTo(screen.width, screen.height); }")
+                    import pyautogui
+                    pyautogui.hotkey("win", "up")
+                    time.sleep(0.5)
                 except Exception:
                     pass
             return self._connected
@@ -196,10 +199,8 @@ class BrowserMCP:
         """对当前页面截图，返回 PIL Image。"""
         if not self._page:
             return None
-        buf = io.BytesIO()
-        self._page.screenshot(path=buf)
-        buf.seek(0)
-        return Image.open(buf) if buf.getbuffer().nbytes > 0 else None
+        raw = self._page.screenshot()
+        return Image.open(io.BytesIO(raw))
 
     def close(self):
         try:

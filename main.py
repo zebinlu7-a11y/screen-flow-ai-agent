@@ -660,10 +660,6 @@ class ScreenAIAgent(QObject):
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()
-        # 清理
-        if thread_holder["t"] and thread_holder["t"].isRunning():
-            thread_holder["t"].quit()
-            thread_holder["t"].wait(3000)
 
     def _toggle_speech(self):
         """切换语音识别开关。"""

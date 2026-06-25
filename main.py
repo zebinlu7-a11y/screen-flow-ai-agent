@@ -617,16 +617,19 @@ class ScreenAIAgent(QObject):
         QTimer.singleShot(0, self._start_gui_agent)
 
     def _start_gui_agent(self):
-        """打开 GUI Agent 命令面板。"""
+        """打开 GUI Agent 命令面板。主线程 QTimer 分片执行。"""
         from gui.gui_agent_panel import GuiAgentDialog
         from agent.gui_agent import run_gui_task
 
         dlg = GuiAgentDialog()
 
         def on_submit(task: str):
-            self._result_window.hide()  # 隐藏避免截图拍到
-            import threading
-            def run():
+            dlg._submit_btn.setEnabled(False)
+            dlg._progress.setVisible(True)
+            dlg._progress.setMaximum(0)
+
+            # 所有 Qt 操作在主线程，不创建子线程
+            def do_task():
                 try:
                     result = run_gui_task(
                         task=task, use_browser=False,
@@ -639,10 +642,8 @@ class ScreenAIAgent(QObject):
                     dlg.set_done(result.get("success", False), msg)
                 except Exception as e:
                     dlg.set_done(False, f"执行异常: {e}")
-                finally:
-                    self._result_window.show()
-            t = threading.Thread(target=run, daemon=True)
-            t.start()
+
+            QTimer.singleShot(100, do_task)
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()

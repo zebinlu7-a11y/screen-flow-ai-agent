@@ -47,7 +47,7 @@ class BrowserMCP:
             if os.path.exists(p):
                 try:
                     subprocess.Popen([p, f"--remote-debugging-port={port}",
-                                      "--new-window", "about:blank"],
+                                      "--new-window", "--start-maximized", "about:blank"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     print(f"[MCP] 已启动浏览器: {p}")
                     time.sleep(2)
@@ -326,15 +326,18 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
     """用 pyautogui 执行桌面操作。"""
     import pyautogui
     pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.2
+    pyautogui.PAUSE = 0.3
 
-    pyautogui.moveTo(x, y)
+    pyautogui.moveTo(x, y, duration=0.2)
     if action == "click":
         pyautogui.click()
     elif action == "fill":
         pyautogui.click()
+        time.sleep(0.3)
+        # 先全选再替换，确保输入干净
+        pyautogui.hotkey("ctrl", "a")
         time.sleep(0.1)
-        pyautogui.write(value, interval=0.03)
+        pyautogui.write(value, interval=0.05)
     elif action == "press":
         key = value or "enter"
         try:
@@ -442,25 +445,26 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
 
 def audit_result(task: str, image: Image.Image,
                  model: str = "doubao-seed-2-0-pro-260215") -> dict:
-    """截图审计：判断任务是否成功。"""
+    """截图审计：对比用户任务与当前屏幕状态。"""
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
     buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="JPEG", quality=80)
+    image.convert("RGB").save(buf, format="JPEG", quality=85)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    prompt = f"""观察当前截图，判断以下任务是否已经成功完成。
+    prompt = f"""你现在是一个验收员。请仔细查看当前屏幕截图，判断以下任务是否已完成。
 
-任务: {task}
+原始任务: {task}
 
-判断标准:
-- 如果截图显示任务目标已达成（如页面已打开、文字已输入、按钮已点击后的结果），返回 success=true
-- 只有非常明确的任务失败才返回 success=false
-- 有疑虑时倾向于 success=true
+请逐项检查：
+1. 浏览器是否打开？能看到什么页面？
+2. 页面URL/标题是否与任务目标一致？
+3. 输入框内容是否正确？
+4. 整体状态是否符合预期？
 
-返回 JSON (不要输出其他内容):
-{{"success": true, "reason": "具体看到了什么", "need_human": false}}"""
+返回 JSON (只输出JSON，不要其他):
+{{"success": true/false, "reason": "当前屏幕显示了什么，与任务的对比结论", "need_human": false/true}}"""
 
     content = [
         {"type": "text", "text": prompt},
@@ -471,10 +475,18 @@ def audit_result(task: str, image: Image.Image,
         llm = ChatDoubaoVL(model_name=model)
         response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
-        m = re.search(r'\{.*\}', text, re.DOTALL)
-        return json.loads(m.group().replace("'", '"')) if m else {"success": False, "need_human": True}
-    except Exception:
-        return {"success": False, "reason": "审计异常", "need_human": True}
+        print(f"[Auditor] AI输出: {text[:500]}" if len(text) > 300 else f"[Auditor] AI输出: {text}")
+        m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+        if m:
+            text = m.group(1)
+        else:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                text = m.group()
+        return json.loads(text.replace("'", '"'))
+    except Exception as e:
+        print(f"[Auditor] 解析失败: {e}")
+        return {"success": False, "reason": f"审计异常: {e}", "need_human": True}
 
 
 # ============================================================

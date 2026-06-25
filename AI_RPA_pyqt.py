@@ -1239,3 +1239,4 @@ if __name__ == "__main__":
     window = CommandManager()
     window.show()
     sys.exit(app.exec_())
+

@@ -60,6 +60,11 @@ class BrowserMCP:
         """连接到浏览器 CDP 端口。auto_launch=True 时自动启动浏览器。"""
         try:
             from playwright.sync_api import sync_playwright
+        except ImportError:
+            print("[MCP] Playwright 未安装: pip install playwright && python -m playwright install chromium")
+            return False
+
+        try:
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
             self._context = self._browser.contexts[0]
@@ -71,6 +76,8 @@ class BrowserMCP:
         except Exception as e:
             if "ECONNREFUSED" in str(e) or "connect" in str(e).lower():
                 if auto_launch and self.launch_browser():
+                    print("[MCP] 浏览器已启动，重试连接...")
+                    time.sleep(2)
                     return self.connect(cdp_url, auto_launch=False)
             print(f"[MCP] 连接失败 (端口 {cdp_url}): {e}")
             return False

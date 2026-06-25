@@ -617,46 +617,84 @@ class ScreenAIAgent(QObject):
         QTimer.singleShot(0, self._start_gui_agent)
 
     def _start_gui_agent(self):
-        """打开 GUI Agent 命令面板。QThread + 信号，不卡 UI。"""
+        """GUI Agent 独立进程 — 不阻塞 UI，不受 Qt 限制。"""
         from gui.gui_agent_panel import GuiAgentDialog
-        from agent.gui_agent import run_gui_task
         from PyQt6.QtCore import QThread, pyqtSignal
+        import subprocess, tempfile, os, sys
 
-        class AgentThread(QThread):
+        class AgentProcessThread(QThread):
             progress = pyqtSignal(str)
             done = pyqtSignal(bool, str)
 
-            def __init__(self, task):
+            def __init__(self, task, use_mcp=False):
                 super().__init__()
                 self._task = task
+                self._use_mcp = use_mcp
 
             def run(self):
                 try:
-                    result = run_gui_task(
-                        task=self._task, use_browser=False,
-                        progress_callback=lambda msg: self.progress.emit(msg),
-                    )
+                    # 写结果到临时文件
+                    result_file = tempfile.mktemp(suffix=".json", prefix="airag_")
+                    script = os.path.join(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__))), "agent", "run_gui_agent.py")
+                    python = sys.executable
+
+                    cmd = [python, script, self._task, "--result", result_file]
+                    if self._use_mcp:
+                        cmd.append("--mcp")
+
+                    self.progress.emit("🚀 启动独立进程...")
+                    env = os.environ.copy()
+                    env["PYTHONIOENCODING"] = "utf-8"
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, encoding="utf-8", errors="replace", env=env)
+
+                    # 实时读取 stdout 作为进度
+                    for line in proc.stdout:
+                        line = line.strip()
+                        if line:
+                            # 提取进度/日志
+                            if "[进度]" in line:
+                                msg = line.split("[进度]", 1)[-1].strip()
+                                self.progress.emit(msg)
+                            elif "[Agent进程]" in line:
+                                msg = line.split("[Agent进程]", 1)[-1].strip()
+                                if not msg.startswith("完成"):
+                                    self.progress.emit(msg)
+
+                    proc.wait()
+
+                    # 读结果
+                    if os.path.exists(result_file):
+                        with open(result_file, "r", encoding="utf-8") as f:
+                            result = json.load(f)
+                    else:
+                        result = {"success": False, "message": "进程异常退出"}
+
                     msg = result.get("message", "")
                     steps = result.get("steps_done", "")
                     if steps:
                         msg = f"[{steps}] {msg}"
+                    elapsed = result.get("elapsed", "")
+                    if elapsed:
+                        msg = f"({elapsed}) {msg}"
                     self.done.emit(result.get("success", False), msg)
+
                 except Exception as e:
-                    self.done.emit(False, f"执行异常: {e}")
+                    self.done.emit(False, f"进程异常: {e}")
 
         dlg = GuiAgentDialog()
-        thread_holder = {"t": None}
 
         def on_submit(task: str):
             dlg._submit_btn.setEnabled(False)
             dlg._progress.setVisible(True)
             dlg._progress.setMaximum(0)
-            t = AgentThread(task)
+            dlg.set_progress("启动独立 Agent 进程...")
+            t = AgentProcessThread(task, use_mcp=True)
             t.progress.connect(dlg.set_progress)
             t.done.connect(dlg.set_done)
             t.finished.connect(t.deleteLater)
             t.start()
-            thread_holder["t"] = t
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()

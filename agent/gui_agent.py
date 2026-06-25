@@ -354,6 +354,30 @@ def _screenshot_desktop() -> Image.Image:
     return pyautogui.screenshot()
 
 
+def _check_browser_open(img: Image.Image) -> bool:
+    """快速检查：截图里是否有已打开的浏览器窗口。"""
+    try:
+        from agent.llm_client import ChatDoubaoVL
+        from langchain_core.messages import HumanMessage
+        import io
+
+        buf = io.BytesIO()
+        img.convert("RGB").resize((640, 360)).save(buf, format="JPEG", quality=50)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        prompt = "看这张截图，浏览器（Edge/Chrome）已经打开并可见了吗？只回答 YES 或 NO。"
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]
+        llm = ChatDoubaoVL(model_name="doubao-seed-2-0-mini-260428")
+        response = llm.invoke([HumanMessage(content=content)])
+        text = (response.content or "").strip().upper() if hasattr(response, 'content') else ""
+        return "YES" in text
+    except Exception:
+        return False
+
+
 def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
     """用 pyautogui 执行桌面操作。"""
     import pyautogui
@@ -553,11 +577,39 @@ def run_gui_task(task: str,
         mcp = BrowserMCP()
         mcp.connect()
 
-    # Phase 1: Analyze
+    # Phase 1: Analyze（如果浏览器已开着，跳过 win+r 步骤）
     if not steps:
+        if progress_callback:
+            progress_callback("🔍 检查当前状态...")
+        # 截图看当前桌面
+        try:
+            screen_img = _screenshot_desktop()
+            is_open = _check_browser_open(screen_img)
+            if is_open:
+                if progress_callback:
+                    progress_callback("  浏览器已打开，直接执行任务步骤")
+        except Exception:
+            is_open = False
+
         if progress_callback:
             progress_callback("🔍 分析任务...")
         steps = analyze_task(task)
+        # 如果浏览器已开，去掉 win+r 和输网址步骤
+        if is_open and steps:
+            steps = [s for s in steps if s.get("target") != "win+r"]
+            # 同时去掉"输入xxx网址"和"确认打开"（前3步通常是打开浏览器的）
+            filtered = []
+            skip_next = False
+            for s in steps:
+                if s.get("action") == "fill" and ("www." in str(s.get("value","")).lower() or "http" in str(s.get("value","")).lower()):
+                    skip_next = True  # 跳过网址输入 + 下一步的确认按键
+                    continue
+                if skip_next and s.get("action") == "press" and s.get("target") in ("enter", "回车"):
+                    skip_next = False
+                    continue
+                skip_next = False
+                filtered.append(s)
+            steps = filtered
 
     if not steps:
         return {"success": False, "message": "任务分析失败"}

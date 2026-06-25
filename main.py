@@ -684,17 +684,17 @@ class ScreenAIAgent(QObject):
                     self.done.emit(False, f"进程异常: {e}")
 
         dlg = GuiAgentDialog()
+        self._agent_thread = None  # 保持引用防止 GC 回收导致崩溃
 
         def on_submit(task: str):
             dlg._submit_btn.setEnabled(False)
             dlg._progress.setVisible(True)
             dlg._progress.setMaximum(0)
             dlg.set_progress("启动独立 Agent 进程...")
-            t = AgentProcessThread(task, use_mcp=True)
-            t.progress.connect(dlg.set_progress)
-            t.done.connect(dlg.set_done)
-            t.finished.connect(t.deleteLater)
-            t.start()
+            self._agent_thread = AgentProcessThread(task, use_mcp=True)
+            self._agent_thread.progress.connect(dlg.set_progress)
+            self._agent_thread.done.connect(dlg.set_done)
+            self._agent_thread.start()
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()

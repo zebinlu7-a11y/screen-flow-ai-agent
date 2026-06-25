@@ -515,7 +515,7 @@ def audit_result(task: str, image: Image.Image,
 # ============================================================
 
 def run_gui_task(task: str,
-                 use_browser: bool = False,  # MCP 与 Qt asyncio 冲突，使用纯视觉模式
+                 use_browser: bool = True,  # 独立进程无 Qt 限制，默认启用 MCP
                  steps: List[dict] = None,
                  progress_callback: Callable = None,
                  hide_window: Callable = None,

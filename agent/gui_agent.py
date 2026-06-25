@@ -430,11 +430,15 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
 
         if pos and pos.get("found"):
             x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
-            w, h = img.size
-            if w not in (1920, 0) and w != 1920:
-                x, y = int(x / w * 1920), int(y / h * 1080)
+            # 用真实屏幕分辨率做坐标映射（不写死 1920×1080）
+            import pyautogui
+            real_w, real_h = pyautogui.size()
+            img_w, img_h = img.size
+            if abs(img_w - real_w) > 10 or abs(img_h - real_h) > 10:
+                x = int(x * real_w / img_w)
+                y = int(y * real_h / img_h)
+            print(f"[Exec] 坐标: AI原始=({pos.get('x')},{pos.get('y')}) 图片={img_w}x{img_h} 屏幕={real_w}x{real_h} → 最终=({x},{y})")
             _pyautogui_execute(action, x, y, value)
-            # 等待操作生效（页面加载、动画等）
             time.sleep(1.5)
             print(f"[Exec] Vision ✅: {desc} ({x},{y})")
             return True

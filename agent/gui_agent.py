@@ -245,15 +245,28 @@ def vision_locate(task: str, image: Image.Image,
 # Analyzer — 任务分解
 # ============================================================
 
-ANALYZER_PROMPT = """你是桌面自动化专家。分析任务并分解为步骤列表。
+ANALYZER_PROMPT = """你是桌面自动化专家。分析任务并分解为最小的操作步骤。
 
-可用动作: click(点击), fill(填写), press(按键), scroll(滚动), wait(等待), navigate(打开网址)
+重要原则:
+1. 如果任务涉及网页/浏览器，第一步必须是打开浏览器（Win+R→输入网址→回车）
+2. 每个步骤只能做一个动作
+3. 把复杂操作拆细（点击前先确保目标可见）
 
-输出纯 JSON:
+可用动作: click(点击元素), fill(填写文字), press(按键盘键), scroll(滚动), wait(等待秒数)
+
+press 的常用键: enter, tab, escape, space, backspace, delete, win+r, ctrl+c, ctrl+v
+组合键放在 target 字段: 如 action="press" target="win+r"
+
+输出纯 JSON，step_id 从 1 开始:
 {{
   "steps": [
-    {{"id":1, "desc":"打开浏览器搜索", "action":"click", "target":"搜索框", "value":"Python"}},
-    {{"id":2, "desc":"按下回车", "action":"press", "target":"enter", "value":""}}
+    {{"step_id":1, "desc":"打开运行窗口", "action":"press", "target":"win+r", "value":""}},
+    {{"step_id":2, "desc":"输入百度网址", "action":"fill", "target":"运行输入框", "value":"www.baidu.com"}},
+    {{"step_id":3, "desc":"确认打开", "action":"press", "target":"enter", "value":""}},
+    {{"step_id":4, "desc":"等待页面加载", "action":"wait", "target":"", "value":"3"}},
+    {{"step_id":5, "desc":"点击搜索框", "action":"click", "target":"搜索框", "value":""}},
+    {{"step_id":6, "desc":"输入搜索词", "action":"fill", "target":"搜索框", "value":"Python"}},
+    {{"step_id":7, "desc":"搜索", "action":"press", "target":"enter", "value":""}}
   ]
 }}
 
@@ -267,9 +280,11 @@ def analyze_task(task: str) -> List[dict]:
     from langchain_core.messages import HumanMessage
 
     try:
+        print(f"[Analyzer] 正在分析: {task}")
         llm = ChatDoubaoVL(model_name="doubao-seed-2-0-lite-260428")
         response = llm.invoke([HumanMessage(content=ANALYZER_PROMPT.format(task=task))])
         text = response.content if hasattr(response, 'content') else ""
+        print(f"[Analyzer] AI 原始输出:\n{text[:800]}")
 
         # 提取 JSON
         m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
@@ -280,7 +295,11 @@ def analyze_task(task: str) -> List[dict]:
             if s >= 0 and e > s:
                 text = text[s:e]
         data = json.loads(text.replace("'", '"'))
-        return data.get("steps", [])
+        steps = data.get("steps", [])
+        print(f"[Analyzer] 分解为 {len(steps)} 步:")
+        for s in steps:
+            print(f"  {s.get('step_id', s.get('id', '?'))}. [{s.get('action', '?')}] {s.get('desc', s.get('target', ''))}")
+        return steps
     except Exception as e:
         print(f"[Analyzer] 失败: {e}")
         return [{"id": 1, "desc": task, "action": "click", "target": task, "value": ""}]

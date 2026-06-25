@@ -33,8 +33,31 @@ class BrowserMCP:
         self._page = None
         self._connected = False
 
-    def connect(self, cdp_url: str = "http://127.0.0.1:9222") -> bool:
-        """连接到浏览器 CDP 端口。需先启动浏览器：msedge --remote-debugging-port=9222"""
+    @staticmethod
+    def launch_browser(port: int = 9222) -> bool:
+        """自动找到 Edge/Chrome 并带 CDP 端口启动。"""
+        import subprocess
+        paths = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    subprocess.Popen([p, f"--remote-debugging-port={port}",
+                                      "--new-window", "about:blank"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"[MCP] 已启动浏览器: {p}")
+                    time.sleep(2)
+                    return True
+                except Exception as e:
+                    print(f"[MCP] 启动失败: {e}")
+        return False
+
+    def connect(self, cdp_url: str = "http://127.0.0.1:9222", auto_launch: bool = True) -> bool:
+        """连接到浏览器 CDP 端口。auto_launch=True 时自动启动浏览器。"""
         try:
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
@@ -46,7 +69,10 @@ class BrowserMCP:
                 print(f"[MCP] 已连接浏览器: {self._page.title()}")
             return self._connected
         except Exception as e:
-            print(f"[MCP] 连接失败: {e}")
+            if "ECONNREFUSED" in str(e) or "connect" in str(e).lower():
+                if auto_launch and self.launch_browser():
+                    return self.connect(cdp_url, auto_launch=False)
+            print(f"[MCP] 连接失败 (端口 {cdp_url}): {e}")
             return False
 
     @property

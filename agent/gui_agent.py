@@ -317,22 +317,7 @@ def analyze_task(task: str) -> List[dict]:
 # ============================================================
 
 def _screenshot_desktop() -> Image.Image:
-    """截取整个桌面。"""
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance()
-    if app:
-        screen = app.primaryScreen()
-        if screen:
-            pixmap = screen.grabWindow(0)
-            img = pixmap.toImage()
-            buf = io.BytesIO()
-            # QImage.save 需要通过 QBuffer
-            from PyQt6.QtCore import QBuffer, QByteArray
-            ba = QByteArray()
-            qbuf = QBuffer(ba)
-            qbuf.open(QBuffer.OpenModeFlag.WriteOnly)
-            img.save(qbuf, "PNG")
-            return Image.open(io.BytesIO(ba.data()))
+    """GUI Agent 专用：全桌面截图（pyautogui，稳定可靠）。"""
     import pyautogui
     return pyautogui.screenshot()
 

@@ -632,6 +632,9 @@ class ScreenAIAgent(QObject):
                     result = run_gui_task(
                         task=task,
                         progress_callback=lambda msg: dlg.set_progress(msg),
+                        # 视觉回退时自动隐藏/显示 Ai_Flow 窗口
+                        hide_window=lambda: QTimer.singleShot(0, self._result_window.hide),
+                        show_window=lambda: QTimer.singleShot(0, self._result_window.show),
                     )
                     msg = result.get("message", "")
                     steps = result.get("steps_done", "")

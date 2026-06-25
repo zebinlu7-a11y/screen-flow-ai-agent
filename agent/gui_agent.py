@@ -328,11 +328,13 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
 
 def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                  use_browser: bool = True,
-                 progress: Callable = None) -> bool:
+                 progress: Callable = None,
+                 hide_window: Callable = None,
+                 show_window: Callable = None) -> bool:
     """
     执行单个步骤。双引擎决策：
-    1. 浏览器 MCP 读码 (DOM扫描 → ai_id → JS执行)
-    2. 视觉识别回退 (截图 → 豆包定位 → pyautogui)
+    1. Playwright MCP (不影响鼠标，无干扰)
+    2. 视觉+pyautogui (先隐藏Ai_Flow窗口避免遮挡)
     """
     action = step.get("action", "click")
     target = step.get("target", step.get("desc", ""))
@@ -342,12 +344,9 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
     if progress:
         progress(f"▶ {desc}")
 
-    # 特殊动作：不需要定位
+    # 特殊动作
     if action == "wait":
-        try:
-            time.sleep(float(value or 1))
-        except Exception:
-            time.sleep(1)
+        time.sleep(float(value or 1) if value else 1)
         return True
     if action == "press":
         import pyautogui
@@ -356,44 +355,36 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         pyautogui.press(key_map.get(key, key))
         return True
 
-    # ===== 引擎 1: 浏览器 MCP 读码识别 =====
+    # ===== 引擎 1: Playwright MCP（优先，不影响鼠标）=====
     if use_browser and mcp and mcp.connected:
         try:
             dom_json = mcp.scan_dom()
             dom_data = json.loads(dom_json)
             elements = dom_data.get("elements", [])
 
-            # 找最匹配的元素
-            best = None
-            best_score = 0
+            best, best_score = None, 0
             for el in elements:
                 text = (el.get("text", "") + el.get("placeholder", "") +
                         el.get("title", "") + el.get("id", "")).lower()
                 score = sum(1 for w in target.lower().split() if w in text)
                 if score > best_score:
-                    best_score = score
-                    best = el
+                    best_score, best = score, el
 
             if best and best_score > 0:
                 ai_id = best["ai_id"]
                 result = mcp.execute_js(ai_id, action, value)
                 if result == "OK":
-                    print(f"[Exec] MCP 成功: {desc} (ai_id={ai_id})")
+                    print(f"[Exec] Playwright ✅: {desc} (ai_id={ai_id})")
                     return True
-                elif "ELEMENT_LOST" in str(result):
-                    print(f"[Exec] MCP 元素丢失，降级视觉...")
-                else:
-                    # move 返回坐标
-                    try:
-                        pos = json.loads(str(result))
-                        _pyautogui_execute(action, int(pos["x"]), int(pos["y"]), value)
-                        return True
-                    except Exception:
-                        pass
+                print(f"[Exec] Playwright 失败 → 降级视觉...")
         except Exception as e:
-            print(f"[Exec] MCP 失败: {e}")
+            print(f"[Exec] Playwright 异常: {e}")
 
-    # ===== 引擎 2: 视觉识别 + pyautogui =====
+    # ===== 引擎 2: 视觉 + pyautogui（隐藏 Ai_Flow 窗口避免遮挡）=====
+    if hide_window:
+        hide_window()
+        time.sleep(0.3)
+
     try:
         img = _screenshot_desktop()
         if mcp and mcp.connected:
@@ -402,20 +393,22 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                 img = page_img
 
         pos = vision_locate(desc, img)
+        if show_window:
+            show_window()
+
         if pos and pos.get("found"):
             x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
-            # 坐标标准化
             w, h = img.size
-            screen_w, screen_h = 1920, 1080
-            x = int(x / max(1, w) * screen_w) if w != screen_w else x
-            y = int(y / max(1, h) * screen_h) if h != screen_h else y
+            if w not in (1920, 0) and w != 1920:
+                x, y = int(x / w * 1920), int(y / h * 1080)
             _pyautogui_execute(action, x, y, value)
-            print(f"[Exec] Vision 成功: {desc} ({x},{y})")
+            print(f"[Exec] Vision ✅: {desc} ({x},{y})")
             return True
-        else:
-            print(f"[Exec] Vision 未找到: {desc}")
+        print(f"[Exec] Vision 未找到: {desc}")
     except Exception as e:
         print(f"[Exec] Vision 异常: {e}")
+        if show_window:
+            show_window()
 
     return False
 
@@ -463,7 +456,9 @@ def audit_result(task: str, image: Image.Image,
 def run_gui_task(task: str,
                  use_browser: bool = False,
                  steps: List[dict] = None,
-                 progress_callback: Callable = None) -> dict:
+                 progress_callback: Callable = None,
+                 hide_window: Callable = None,
+                 show_window: Callable = None) -> dict:
     """完整 RPA 流水线。"""
     mcp = None
     if use_browser:
@@ -482,7 +477,8 @@ def run_gui_task(task: str,
     # Phase 2: Execute
     ok = 0
     for i, step in enumerate(steps):
-        success = execute_step(step, mcp, use_browser, progress_callback)
+        success = execute_step(step, mcp, use_browser, progress_callback,
+                               hide_window, show_window)
         if success:
             ok += 1
         time.sleep(0.5)

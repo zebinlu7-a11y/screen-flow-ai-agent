@@ -486,7 +486,7 @@ def audit_result(task: str, image: Image.Image,
 # ============================================================
 
 def run_gui_task(task: str,
-                 use_browser: bool = False,
+                 use_browser: bool = True,  # 默认启用浏览器 MCP
                  steps: List[dict] = None,
                  progress_callback: Callable = None,
                  hide_window: Callable = None,

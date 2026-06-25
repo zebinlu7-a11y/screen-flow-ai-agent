@@ -293,8 +293,9 @@ press 的常用键: enter, tab, escape, space, backspace, delete, win+r, ctrl+c,
     {{"step_id":1, "desc":"打开运行窗口", "action":"press", "target":"win+r", "value":""}},
     {{"step_id":2, "desc":"输入百度网址", "action":"fill", "target":"运行输入框", "value":"www.baidu.com"}},
     {{"step_id":3, "desc":"确认打开", "action":"press", "target":"enter", "value":""}},
-    {{"step_id":4, "desc":"等待页面加载", "action":"wait", "target":"", "value":"3"}},
-    {{"step_id":5, "desc":"点击搜索框", "action":"click", "target":"搜索框", "value":""}},
+    {{"step_id":4, "desc":"等待页面加载", "action":"wait", "target":"", "value":"5"}},
+    {{"step_id":5, "desc":"最大化浏览器窗口", "action":"press", "target":"win+up", "value":""}},
+    {{"step_id":6, "desc":"点击搜索框", "action":"click", "target":"搜索框", "value":""}},
     {{"step_id":6, "desc":"输入搜索词", "action":"fill", "target":"搜索框", "value":"Python"}},
     {{"step_id":7, "desc":"搜索", "action":"press", "target":"enter", "value":""}}
   ]
@@ -363,10 +364,20 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
         pyautogui.write(value, interval=0.05)
     elif action == "press":
         key = value or "enter"
-        try:
-            pyautogui.press(key)
-        except Exception:
-            pass
+        # 处理组合键
+        combo_map = {"win+up": ("win", "up"), "win+d": ("win", "d"),
+                     "alt+tab": ("alt", "tab"), "ctrl+c": ("ctrl", "c"),
+                     "ctrl+v": ("ctrl", "v"), "ctrl+a": ("ctrl", "a")}
+        if key in combo_map:
+            pyautogui.hotkey(*combo_map[key])
+        elif "+" in key:
+            parts = key.split("+")
+            pyautogui.hotkey(*parts)
+        else:
+            try:
+                pyautogui.press(key)
+            except Exception:
+                pass
 
 
 def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,

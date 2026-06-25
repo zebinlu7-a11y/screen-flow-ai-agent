@@ -504,11 +504,21 @@ def run_gui_task(task: str,
 
     # Phase 2: Execute
     ok = 0
+    total = len(steps)
     for i, step in enumerate(steps):
-        success = execute_step(step, mcp, use_browser, progress_callback,
+        action = step.get("action", "click")
+        desc = step.get("desc", step.get("target", ""))
+        if progress_callback:
+            progress_callback(f"[{i+1}/{total}] {desc}")
+        success = execute_step(step, mcp, use_browser, None,
                                hide_window, show_window)
         if success:
             ok += 1
+            if progress_callback:
+                progress_callback(f"  ✅ {desc}")
+        else:
+            if progress_callback:
+                progress_callback(f"  ⚠️ {desc} (跳过)")
         time.sleep(0.5)
 
     # 给操作留出生效时间

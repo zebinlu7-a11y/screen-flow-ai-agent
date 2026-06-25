@@ -130,11 +130,12 @@ class GuiAgentDialog(QDialog):
         self._status.setText(msg)
 
     def set_done(self, success: bool, msg: str):
-        """执行完成。"""
+        """执行完成（不自动关闭，等待用户查看结果）。"""
         self._progress.setMaximum(100)
         self._progress.setValue(100 if success else 0)
-        self._status.setText(msg)
-        self._submit_btn.setText("完成")
+        icon = "✅" if success else "❌"
+        self._status.setText(f"{icon} {msg}")
+        self._submit_btn.setText("关闭")
         self._submit_btn.setEnabled(True)
         self._submit_btn.clicked.disconnect()
         self._submit_btn.clicked.connect(self.accept)

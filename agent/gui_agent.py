@@ -1,402 +1,482 @@
 """
-GUI Agent — 三模型协作自动化桌面操作。
+GUI Agent RPA — 浏览器 MCP (Playwright CDP) + 视觉识别双引擎。
 
-架构:
-  用户指令 → Analyzer(分析) → Executor(执行) → Auditor(审计)
-
-  Analyzer: pro/lite 模型，任务分解为步骤列表
-  Executor: mini 模型，每步截图→AI定位→pyautogui执行
-  Auditor:  pro 模型，截图验证最终结果是否成功
+参考 AI_RPA_pyqt.py 架构：
+  1. 读码识别：通过 Playwright CDP 注入 JS 扫描 DOM，返回元素 ai_id
+  2. 视觉识别：截图后用豆包 Vision 模型定位坐标
+  3. 三层执行：JS events → pyautogui → 豆包视觉回退
 """
+import os
+import re
+import json
 import time
 import base64
 import io
-import json
+import threading
 from typing import List, Optional, Dict, Callable
 from dataclasses import dataclass, field
+
 from PIL import Image
 
 
-@dataclass
-class ActionStep:
-    """单个操作步骤。"""
-    step_id: int
-    description: str           # 人类可读描述
-    action_type: str           # click | type | scroll | wait | screenshot | navigate | press
-    target: str                # 操作目标描述（如"搜索框"）
-    value: str = ""            # 输入内容（type动作）
-    position: tuple = None     # 执行后填充的坐标
-    status: str = "pending"    # pending | running | done | failed
+# ============================================================
+# Browser MCP Engine (Playwright CDP)
+# ============================================================
 
+class BrowserMCP:
+    """Playwright 连接 Edge/Chrome CDP 进行 DOM 操作。"""
 
-@dataclass
-class AgentResult:
-    """Agent 执行结果。"""
-    success: bool
-    message: str
-    steps: List[ActionStep] = field(default_factory=list)
-    screenshots: List[str] = field(default_factory=list)
+    def __init__(self):
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._connected = False
+
+    def connect(self, cdp_url: str = "http://127.0.0.1:9222") -> bool:
+        """连接到浏览器 CDP 端口。需先启动浏览器：msedge --remote-debugging-port=9222"""
+        try:
+            from playwright.sync_api import sync_playwright
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
+            self._context = self._browser.contexts[0]
+            self._page = self._context.pages[0] if self._context.pages else None
+            self._connected = bool(self._page)
+            if self._connected:
+                print(f"[MCP] 已连接浏览器: {self._page.title()}")
+            return self._connected
+        except Exception as e:
+            print(f"[MCP] 连接失败: {e}")
+            return False
+
+    @property
+    def page(self):
+        return self._page
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def get_active_page(self):
+        """获取最后打开的页面。"""
+        if not self._context:
+            return None
+        pages = self._context.pages
+        if pages:
+            self._page = pages[-1]
+        return self._page
+
+    def scan_dom(self) -> str:
+        """注入 JS 扫描 DOM，返回 JSON 字符串 {pageInfo, elements}。"""
+        if not self._page:
+            return "{}"
+        self.get_active_page()
+        script = """
+        () => {
+            window._ai_elements = [];
+            const elements = [];
+            let i = 0;
+            const pageInfo = {
+                title: document.title,
+                url: window.location.href,
+                viewport: { width: window.innerWidth, height: window.innerHeight }
+            };
+            const selectors = 'input, button, textarea, a, [role="button"], .el-button, .el-input__inner, span, div, li, h1, h2, h3, h4, h5, h6, p, label, form, select, option, img, section, article, nav, header, footer';
+            const nodes = document.querySelectorAll(selectors);
+            nodes.forEach(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 1 && rect.height > 1 && rect.top < window.innerHeight + 1000) {
+                    const text = (el.innerText || el.value || el.placeholder || el.title || "").trim().substring(0, 100);
+                    elements.push({
+                        tag: el.tagName,
+                        text: text,
+                        value: el.value || "",
+                        placeholder: el.placeholder || "",
+                        title: el.title || "",
+                        id: el.id || "",
+                        className: (el.className || "").substring(0, 80),
+                        href: el.href || "",
+                        type: el.type || el.getAttribute('type') || "",
+                        role: el.getAttribute('role') || "",
+                        pos: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+                        ai_id: i
+                    });
+                    window._ai_elements.push(el);
+                    i++;
+                }
+            });
+            return JSON.stringify({ pageInfo: pageInfo, elements: elements });
+        }
+        """
+        return self._page.evaluate(script)
+
+    def execute_js(self, ai_id: int, action: str, value: str = "") -> str:
+        """通过 JS 在页面上执行操作。返回 "OK" / "ELEMENT_LOST" / 坐标JSON。"""
+        js = f"""
+        (val) => {{
+            const el = window._ai_elements[{ai_id}];
+            if (!el) return "ELEMENT_LOST";
+            el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+
+            if ("{action}" === "click") {{
+                const opts = {{ bubbles: true, cancelable: true, view: window, buttons: 1 }};
+                el.dispatchEvent(new PointerEvent('pointerdown', opts));
+                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                el.focus();
+                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                el.dispatchEvent(new PointerEvent('pointerup', opts));
+                el.click();
+                return "OK";
+            }}
+            else if ("{action}" === "fill") {{
+                el.focus();
+                el.value = val;
+                ['input', 'change', 'blur'].forEach(ev => {{
+                    el.dispatchEvent(new Event(ev, {{ bubbles: true }}));
+                }});
+                return "OK";
+            }}
+            else if ("{action}" === "move") {{
+                const r = el.getBoundingClientRect();
+                return JSON.stringify({{ x: r.left + r.width/2, y: r.top + r.height/2 }});
+            }}
+            return "OK";
+        }}
+        """
+        return self._page.evaluate(js, str(value))
+
+    def screenshot_page(self) -> Optional[Image.Image]:
+        """对当前页面截图，返回 PIL Image。"""
+        if not self._page:
+            return None
+        buf = io.BytesIO()
+        self._page.screenshot(path=buf)
+        buf.seek(0)
+        return Image.open(buf) if buf.getbuffer().nbytes > 0 else None
+
+    def close(self):
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
 
 
 # ============================================================
-# 1. Analyzer — 任务分解
+# Vision Engine (豆包 VL 截图定位)
 # ============================================================
 
-ANALYZER_PROMPT = """你是一个桌面自动化专家。用户给你一个任务，你需要把它分解为一步步的桌面操作。
+VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确坐标。
 
-可用操作类型:
-- click: 点击屏幕上的某个元素（如按钮、输入框、链接）
-- type: 输入文字
-- press: 按下键盘按键（如 enter, tab, ctrl+c）
-- scroll: 滚动页面（值: up/down/up_much/down_much）
-- wait: 等待（值: 秒数）
-- screenshot: 截屏确认当前状态（不需要target）
+用户指令: {task}
 
-输出格式 (纯JSON):
-{
-  "steps": [
-    {"step_id": 1, "description": "打开浏览器", "action_type": "press", "target": "win+r", "value": ""},
-    {"step_id": 2, "description": "输入网址", "action_type": "type", "target": "地址栏", "value": "https://www.baidu.com"},
-    {"step_id": 3, "description": "确认", "action_type": "press", "target": "enter", "value": ""}
-  ]
-}
-
-注意:
-1. 第一步建议先截屏确认当前桌面状态
-2. 如果目标不明确，加一个 screenshot step 让AI观察
-3. 每个步骤的 target 要具体（如"搜索输入框"而非"输入框"）
-
-用户任务: {task}
-
-请输出JSON:"""
+返回 JSON:
+{{
+  "found": true,
+  "x": 500,
+  "y": 300,
+  "reason": "简短原因"
+}}"""
 
 
-def analyze_task(task: str, model_name: str = "doubao-seed-2-0-lite-260428") -> List[ActionStep]:
-    """用 AI 将用户任务分解为操作步骤。"""
+def vision_locate(task: str, image: Image.Image,
+                  model: str = "doubao-seed-2-0-lite-260428") -> Optional[dict]:
+    """用豆包 VL 观察截图，返回元素坐标。"""
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
-    prompt = ANALYZER_PROMPT.format(task=task)
+    # PIL → base64 JPEG
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=80)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    content = [
+        {"type": "text", "text": VISION_PROMPT.format(task=task)},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+    ]
 
     try:
-        llm = ChatDoubaoVL(model_name=model_name)
-        response = llm.invoke([HumanMessage(content=prompt)])
+        llm = ChatDoubaoVL(model_name=model)
+        response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
 
-        # 提取 JSON（支持 markdown code block）
-        import re as _re
-        # 先取 ```json ... ``` 代码块
-        m = _re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+        # 解析 JSON
+        m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
         if m:
             text = m.group(1)
         else:
-            # 直接找第一个 { 到最后一个 }
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                text = text[start:end]
-
-        data = json.loads(text)
-        steps = []
-        raw_steps = data.get("steps", data.get("actions", data.get("operations", [])))
-        for i, s in enumerate(raw_steps, 1):
-            steps.append(ActionStep(
-                step_id=s.get("step_id", s.get("id", i)),
-                description=s.get("description", s.get("desc", s.get("action", ""))),
-                action_type=s.get("action_type", s.get("type", "click")),
-                target=s.get("target", s.get("element", s.get("目标", ""))),
-                value=s.get("value", s.get("text", s.get("content", ""))),
-            ))
-        return steps
+            s = text.find("{")
+            e = text.rfind("}") + 1
+            if s >= 0 and e > s:
+                text = text[s:e]
+        return json.loads(text.replace("'", '"'))
     except Exception as e:
-        print(f"[Analyzer] 解析失败: {e}\n原始输出: {text[:500]}")
-
-    # 回退：整个任务作为单步
-    return [ActionStep(
-        step_id=1, description=task,
-        action_type="screenshot", target="", value=""
-    )]
+        print(f"[Vision] 识别失败: {e}")
+        return None
 
 
 # ============================================================
-# 2. Executor — 逐步执行
+# Analyzer — 任务分解
 # ============================================================
 
-EXECUTOR_PROMPT = """你是一个精确的屏幕操作执行器。我会给你当前屏幕截图和一个操作指令。
-你需要观察截图，找出目标元素的位置，返回精确坐标。
+ANALYZER_PROMPT = """你是桌面自动化专家。分析任务并分解为步骤列表。
 
-输出格式 (纯JSON):
-{
-  "found": true/false,
-  "x": 500,
-  "y": 300,
-  "reason": "搜索框位于页面顶部居中位置，坐标约为500,300"
-}
+可用动作: click(点击), fill(填写), press(按键), scroll(滚动), wait(等待), navigate(打开网址)
 
-如果没有找到目标元素，found 设为 false，说明原因。
+输出纯 JSON:
+{{
+  "steps": [
+    {{"id":1, "desc":"打开浏览器搜索", "action":"click", "target":"搜索框", "value":"Python"}},
+    {{"id":2, "desc":"按下回车", "action":"press", "target":"enter", "value":""}}
+  ]
+}}
 
-当前操作: {action_description}
-操作类型: {action_type}
-目标: {target}
-输入值: {value}"""
+任务: {task}
+输出 JSON:"""
 
 
-def _screenshot_pil() -> Image.Image:
-    """截取全屏，返回 PIL Image。"""
+def analyze_task(task: str) -> List[dict]:
+    """AI 分解任务为步骤列表。"""
+    from agent.llm_client import ChatDoubaoVL
+    from langchain_core.messages import HumanMessage
+
+    try:
+        llm = ChatDoubaoVL(model_name="doubao-seed-2-0-lite-260428")
+        response = llm.invoke([HumanMessage(content=ANALYZER_PROMPT.format(task=task))])
+        text = response.content if hasattr(response, 'content') else ""
+
+        # 提取 JSON
+        m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+        if m:
+            text = m.group(1)
+        else:
+            s, e = text.find("{"), text.rfind("}") + 1
+            if s >= 0 and e > s:
+                text = text[s:e]
+        data = json.loads(text.replace("'", '"'))
+        return data.get("steps", [])
+    except Exception as e:
+        print(f"[Analyzer] 失败: {e}")
+        return [{"id": 1, "desc": task, "action": "click", "target": task, "value": ""}]
+
+
+# ============================================================
+# Executor — 双引擎执行
+# ============================================================
+
+def _screenshot_desktop() -> Image.Image:
+    """截取整个桌面。"""
     from PyQt6.QtWidgets import QApplication
     app = QApplication.instance()
     if app:
         screen = app.primaryScreen()
         if screen:
             pixmap = screen.grabWindow(0)
-            byte_arr = io.BytesIO()
-            pixmap.save(byte_arr, "PNG")
-            return Image.open(byte_arr)
-
-    # 回退：pyautogui
+            buf = io.BytesIO()
+            pixmap.save(buf, "PNG")
+            return Image.open(buf)
     import pyautogui
     return pyautogui.screenshot()
 
 
-def _pil_to_base64(img: Image.Image) -> str:
-    """PIL Image → base64 JPEG。"""
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=80)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def _executor_locate(step: ActionStep, screenshot_b64: str,
-                     model_name: str = "doubao-seed-2-0-mini-260428") -> Optional[tuple]:
-    """AI 观察截图，定位操作目标。"""
-    from agent.llm_client import ChatDoubaoVL
-    from langchain_core.messages import HumanMessage
-
-    content = [
-        {"type": "text", "text": EXECUTOR_PROMPT.format(
-            action_description=step.description,
-            action_type=step.action_type,
-            target=step.target,
-            value=step.value,
-        )},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}},
-    ]
-
-    try:
-        llm = ChatDoubaoVL(model_name=model_name)
-        response = llm.invoke([HumanMessage(content=content)])
-        text = response.content if hasattr(response, 'content') else ""
-
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(text[start:end])
-            if data.get("found") and data.get("x") and data.get("y"):
-                return (int(data["x"]), int(data["y"]))
-    except Exception as e:
-        print(f"[Executor] 定位失败: {e}")
-
-    return None
-
-
-def execute_step(step: ActionStep, model_name: str = "doubao-seed-2-0-mini-260428") -> bool:
-    """执行单个操作步骤。返回是否成功。"""
+def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
+    """用 pyautogui 执行桌面操作。"""
     import pyautogui
     pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.3
+    pyautogui.PAUSE = 0.2
 
-    step.status = "running"
+    pyautogui.moveTo(x, y)
+    if action == "click":
+        pyautogui.click()
+    elif action == "fill":
+        pyautogui.click()
+        time.sleep(0.1)
+        pyautogui.write(value, interval=0.03)
+    elif action == "press":
+        key = value or "enter"
+        try:
+            pyautogui.press(key)
+        except Exception:
+            pass
 
-    action = step.action_type
+
+def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
+                 use_browser: bool = True,
+                 progress: Callable = None) -> bool:
+    """
+    执行单个步骤。双引擎决策：
+    1. 浏览器 MCP 读码 (DOM扫描 → ai_id → JS执行)
+    2. 视觉识别回退 (截图 → 豆包定位 → pyautogui)
+    """
+    action = step.get("action", "click")
+    target = step.get("target", step.get("desc", ""))
+    value = step.get("value", "")
+    desc = step.get("desc", target)
+
+    if progress:
+        progress(f"▶ {desc}")
+
+    # 特殊动作：不需要定位
     if action == "wait":
         try:
-            time.sleep(float(step.value or 1))
+            time.sleep(float(value or 1))
         except Exception:
             time.sleep(1)
-        step.status = "done"
+        return True
+    if action == "press":
+        import pyautogui
+        key = value or target or "enter"
+        key_map = {"回车": "enter", "空格": "space", "tab": "tab", "esc": "escape"}
+        pyautogui.press(key_map.get(key, key))
         return True
 
-    if action == "screenshot":
-        step.status = "done"
-        return True
+    # ===== 引擎 1: 浏览器 MCP 读码识别 =====
+    if use_browser and mcp and mcp.connected:
+        try:
+            dom_json = mcp.scan_dom()
+            dom_data = json.loads(dom_json)
+            elements = dom_data.get("elements", [])
 
-    # 需要定位的动作
-    if action in ("click", "type", "scroll"):
-        # 截图 → AI 定位
-        img = _screenshot_pil()
-        b64 = _pil_to_base64(img)
+            # 找最匹配的元素
+            best = None
+            best_score = 0
+            for el in elements:
+                text = (el.get("text", "") + el.get("placeholder", "") +
+                        el.get("title", "") + el.get("id", "")).lower()
+                score = sum(1 for w in target.lower().split() if w in text)
+                if score > best_score:
+                    best_score = score
+                    best = el
 
-        pos = _executor_locate(step, b64, model_name)
-        if pos is None:
-            step.status = "failed"
-            print(f"[Executor] 找不到目标: {step.target}")
-            return False
-        step.position = pos
+            if best and best_score > 0:
+                ai_id = best["ai_id"]
+                result = mcp.execute_js(ai_id, action, value)
+                if result == "OK":
+                    print(f"[Exec] MCP 成功: {desc} (ai_id={ai_id})")
+                    return True
+                elif "ELEMENT_LOST" in str(result):
+                    print(f"[Exec] MCP 元素丢失，降级视觉...")
+                else:
+                    # move 返回坐标
+                    try:
+                        pos = json.loads(str(result))
+                        _pyautogui_execute(action, int(pos["x"]), int(pos["y"]), value)
+                        return True
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[Exec] MCP 失败: {e}")
 
+    # ===== 引擎 2: 视觉识别 + pyautogui =====
     try:
-        if action == "click":
-            x, y = step.position
-            pyautogui.click(x, y)
+        img = _screenshot_desktop()
+        if mcp and mcp.connected:
+            page_img = mcp.screenshot_page()
+            if page_img:
+                img = page_img
 
-        elif action == "type":
-            if step.position:
-                x, y = step.position
-                pyautogui.click(x, y)
-                time.sleep(0.2)
-            pyautogui.write(step.value, interval=0.05)
-
-        elif action == "press":
-            key = step.target.lower()
-            key_map = {
-                "enter": "enter", "tab": "tab", "escape": "esc",
-                "win+r": ("win", "r"), "ctrl+c": ("ctrl", "c"),
-                "ctrl+v": ("ctrl", "v"), "ctrl+a": ("ctrl", "a"),
-                "ctrl+f": ("ctrl", "f"), "alt+tab": ("alt", "tab"),
-                "backspace": "backspace", "delete": "delete",
-                "space": "space", "up": "up", "down": "down",
-                "left": "left", "right": "right",
-                "pageup": "pageup", "pagedown": "pagedown",
-                "home": "home", "end": "end",
-            }
-            mapped = key_map.get(key, key)
-            if isinstance(mapped, tuple):
-                pyautogui.hotkey(*mapped)
-            else:
-                pyautogui.press(mapped)
-
-        elif action == "scroll":
-            amount = {"up": 3, "down": -3, "up_much": 10, "down_much": -10}
-            clicks = amount.get(step.value, -3)
-            if step.position:
-                x, y = step.position
-                pyautogui.moveTo(x, y)
-            pyautogui.scroll(clicks)
-
-        step.status = "done"
-        return True
-
+        pos = vision_locate(desc, img)
+        if pos and pos.get("found"):
+            x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
+            # 坐标标准化
+            w, h = img.size
+            screen_w, screen_h = 1920, 1080
+            x = int(x / max(1, w) * screen_w) if w != screen_w else x
+            y = int(y / max(1, h) * screen_h) if h != screen_h else y
+            _pyautogui_execute(action, x, y, value)
+            print(f"[Exec] Vision 成功: {desc} ({x},{y})")
+            return True
+        else:
+            print(f"[Exec] Vision 未找到: {desc}")
     except Exception as e:
-        step.status = "failed"
-        print(f"[Executor] 执行失败: {step.description} - {e}")
-        return False
+        print(f"[Exec] Vision 异常: {e}")
+
+    return False
 
 
 # ============================================================
-# 3. Auditor — 结果验证
+# Auditor
 # ============================================================
 
-AUDITOR_PROMPT = """你是一个结果审计员。我会给你当前屏幕截图和原始任务描述。
-请判断任务是否已经成功完成。
-
-输出格式 (纯JSON):
-{
-  "success": true/false,
-  "confidence": 0.95,
-  "reason": "页面显示了百度搜索结果，包含Python教程相关链接",
-  "need_human": false
-}
-
-任务: {task}
-请输出JSON:"""
-
-
-def audit_result(task: str, screenshot_b64: str,
-                 model_name: str = "doubao-seed-2-0-pro-260215") -> dict:
-    """审计执行结果。"""
+def audit_result(task: str, image: Image.Image,
+                 model: str = "doubao-seed-2-0-pro-260215") -> dict:
+    """截图审计：判断任务是否成功。"""
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=80)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    prompt = f"""观察截图，判断任务是否完成。
+
+任务: {task}
+
+返回 JSON:
+{{"success": true/false, "reason": "简短说明", "need_human": false}}"""
+
     content = [
-        {"type": "text", "text": AUDITOR_PROMPT.format(task=task)},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}},
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
     ]
 
     try:
-        llm = ChatDoubaoVL(model_name=model_name)
+        llm = ChatDoubaoVL(model_name=model)
         response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
-
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-    except Exception as e:
-        print(f"[Auditor] 审计失败: {e}")
-
-    return {"success": False, "confidence": 0, "reason": str(e), "need_human": True}
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        return json.loads(m.group().replace("'", '"')) if m else {"success": False, "need_human": True}
+    except Exception:
+        return {"success": False, "reason": "审计异常", "need_human": True}
 
 
 # ============================================================
-# 4. Orchestrator — 主控
+# Main Pipeline
 # ============================================================
 
 def run_gui_task(task: str,
-                 analyzer_model: str = "doubao-seed-2-0-lite-260428",
-                 executor_model: str = "doubao-seed-2-0-mini-260428",
-                 auditor_model: str = "doubao-seed-2-0-pro-260215",
-                 progress_callback: Optional[Callable] = None,
-                 ) -> AgentResult:
-    """
-    执行 GUI 自动化任务。
-
-    Args:
-        task: 用户任务描述，如"打开百度搜索Python"
-        analyzer_model: 分析模型
-        executor_model: 执行模型
-        auditor_model: 审计模型
-        progress_callback: 进度回调 (step描述)
-
-    Returns:
-        AgentResult
-    """
-    result = AgentResult(success=False, message="")
+                 use_browser: bool = False,
+                 steps: List[dict] = None,
+                 progress_callback: Callable = None) -> dict:
+    """完整 RPA 流水线。"""
+    mcp = None
+    if use_browser:
+        mcp = BrowserMCP()
+        mcp.connect()
 
     # Phase 1: Analyze
-    if progress_callback:
-        progress_callback("🔍 分析任务...")
-    print(f"[GUI-Agent] 分析任务: {task}")
-    steps = analyze_task(task, analyzer_model)
+    if not steps:
+        if progress_callback:
+            progress_callback("🔍 分析任务...")
+        steps = analyze_task(task)
 
     if not steps:
-        result.message = "任务分析失败，无法生成步骤"
-        return result
-
-    result.steps = steps
-    print(f"[GUI-Agent] 分析完成: {len(steps)} 步")
-    for s in steps:
-        print(f"  {s.step_id}. [{s.action_type}] {s.description}")
+        return {"success": False, "message": "任务分析失败"}
 
     # Phase 2: Execute
+    ok = 0
     for i, step in enumerate(steps):
-        if progress_callback:
-            progress_callback(f"▶ 执行 ({i+1}/{len(steps)}): {step.description}")
-
-        print(f"[GUI-Agent] 执行 {i+1}/{len(steps)}: {step.description}")
-        success = execute_step(step, executor_model)
-
-        if not success and step.action_type not in ("screenshot", "wait"):
-            # 失败不中断，继续尝试后续步骤
-            print(f"[GUI-Agent] 步骤 {step.step_id} 失败，继续...")
-
+        success = execute_step(step, mcp, use_browser, progress_callback)
+        if success:
+            ok += 1
         time.sleep(0.5)
 
     # Phase 3: Audit
     if progress_callback:
-        progress_callback("🔎 审计结果...")
+        progress_callback("🔎 审计中...")
+    img = _screenshot_desktop()
+    if mcp and mcp.connected:
+        page_img = mcp.screenshot_page()
+        if page_img:
+            img = page_img
+    audit = audit_result(task, img)
 
-    print("[GUI-Agent] 审计中...")
-    final_img = _screenshot_pil()
-    final_b64 = _pil_to_base64(final_img)
-    audit = audit_result(task, final_b64, auditor_model)
+    if mcp:
+        mcp.close()
 
-    result.success = audit.get("success", False)
-    result.message = audit.get("reason", "")
-    if audit.get("need_human"):
-        result.message += "\n⚠️ 建议人工审查"
-
-    if progress_callback:
-        if result.success:
-            progress_callback(f"✅ 执行成功: {result.message}")
-        else:
-            progress_callback(f"❌ 执行失败: {result.message}")
-
-    return result
+    return {
+        "success": audit.get("success", False),
+        "message": audit.get("reason", ""),
+        "steps_done": f"{ok}/{len(steps)}",
+        "need_human": audit.get("need_human", not audit.get("success")),
+    }

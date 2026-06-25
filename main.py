@@ -633,7 +633,11 @@ class ScreenAIAgent(QObject):
                         task=task,
                         progress_callback=lambda msg: dlg.set_progress(msg),
                     )
-                    dlg.set_done(result.success, result.message)
+                    msg = result.get("message", "")
+                    steps = result.get("steps_done", "")
+                    if steps:
+                        msg = f"[{steps}] {msg}"
+                    dlg.set_done(result.get("success", False), msg)
                 except Exception as e:
                     dlg.set_done(False, f"执行异常: {e}")
 

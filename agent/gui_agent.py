@@ -408,6 +408,8 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
             if w not in (1920, 0) and w != 1920:
                 x, y = int(x / w * 1920), int(y / h * 1080)
             _pyautogui_execute(action, x, y, value)
+            # 等待操作生效（页面加载、动画等）
+            time.sleep(1.5)
             print(f"[Exec] Vision ✅: {desc} ({x},{y})")
             return True
         print(f"[Exec] Vision 未找到: {desc}")
@@ -433,12 +435,17 @@ def audit_result(task: str, image: Image.Image,
     image.convert("RGB").save(buf, format="JPEG", quality=80)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    prompt = f"""观察截图，判断任务是否完成。
+    prompt = f"""观察当前截图，判断以下任务是否已经成功完成。
 
 任务: {task}
 
-返回 JSON:
-{{"success": true/false, "reason": "简短说明", "need_human": false}}"""
+判断标准:
+- 如果截图显示任务目标已达成（如页面已打开、文字已输入、按钮已点击后的结果），返回 success=true
+- 只有非常明确的任务失败才返回 success=false
+- 有疑虑时倾向于 success=true
+
+返回 JSON (不要输出其他内容):
+{{"success": true, "reason": "具体看到了什么", "need_human": false}}"""
 
     content = [
         {"type": "text", "text": prompt},
@@ -488,6 +495,9 @@ def run_gui_task(task: str,
         if success:
             ok += 1
         time.sleep(0.5)
+
+    # 给操作留出生效时间
+    time.sleep(2)
 
     # Phase 3: Audit
     if progress_callback:

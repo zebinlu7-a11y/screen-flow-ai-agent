@@ -356,12 +356,15 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
     if action == "click":
         pyautogui.click()
     elif action == "fill":
-        pyautogui.click()
-        time.sleep(0.3)
-        # 先全选再替换，确保输入干净
+        # 双击选中 → 全选 → 删除 → 写入
+        pyautogui.click(clicks=2)
+        time.sleep(0.2)
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.1)
+        pyautogui.press("backspace")
+        time.sleep(0.1)
         pyautogui.write(value, interval=0.05)
+        print(f"[Exec] ✅ 输入: '{value}'")
     elif action == "press":
         key = value or "enter"
         # 处理组合键
@@ -581,6 +584,14 @@ def run_gui_task(task: str,
         else:
             if progress_callback:
                 progress_callback(f"  ⚠️ {desc} (跳过)")
+        time.sleep(0.5)
+
+    # 浏览器打开后自动最大化
+    if any(s.get("action") == "press" and s.get("target") == "enter" for s in steps):
+        time.sleep(1)
+        print("[Agent] 自动最大化浏览器...")
+        import pyautogui
+        pyautogui.hotkey("win", "up")
         time.sleep(0.5)
 
     # 给操作留出生效时间

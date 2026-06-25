@@ -16,10 +16,7 @@ import threading
 from typing import List, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
-import pyautogui  # 主线程导入，避免后台线程跨线程问题
 from PIL import Image
-from agent.llm_client import ChatDoubaoVL  # 主线程导入 LLM 客户端
-from langchain_core.messages import HumanMessage, SystemMessage
 
 
 # ============================================================
@@ -40,7 +37,7 @@ class BrowserMCP:
     def launch_browser(port: int = 9222) -> bool:
         """自动找到 Edge/Chrome 并带 CDP 端口启动。先关闭已有进程确保 CDP 生效。"""
         import subprocess
-        # 先关闭所有 Edge 进程（否则 CDP 端口不生效）
+        # 先关闭所有 Edge 进程
         try:
             subprocess.run(["taskkill", "/f", "/im", "msedge.exe"],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -233,7 +230,7 @@ class BrowserMCP:
 # Vision Engine (豆包 VL 截图定位)
 # ============================================================
 
-VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确中心坐标。
+VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确坐标。
 
 用户指令: {task}
 
@@ -353,31 +350,8 @@ def analyze_task(task: str) -> List[dict]:
 
 def _screenshot_desktop() -> Image.Image:
     """GUI Agent 专用：全桌面截图（pyautogui，稳定可靠）。"""
+    import pyautogui
     return pyautogui.screenshot()
-
-
-def _check_browser_open(img: Image.Image) -> bool:
-    """快速检查：截图里是否有已打开的浏览器窗口。"""
-    try:
-        from agent.llm_client import ChatDoubaoVL
-        from langchain_core.messages import HumanMessage
-        import io
-
-        buf = io.BytesIO()
-        img.convert("RGB").resize((640, 360)).save(buf, format="JPEG", quality=50)
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        prompt = "看这张截图，浏览器（Edge/Chrome）已经打开并可见了吗？只回答 YES 或 NO。"
-        content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-        ]
-        llm = ChatDoubaoVL(model_name="doubao-seed-2-0-mini-260428")
-        response = llm.invoke([HumanMessage(content=content)])
-        text = (response.content or "").strip().upper() if hasattr(response, 'content') else ""
-        return "YES" in text
-    except Exception:
-        return False
 
 
 def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
@@ -390,36 +364,25 @@ def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
     if action == "click":
         pyautogui.click()
     elif action == "fill":
-        # 双击选中 → 全选 → 删除 → 写入
-        pyautogui.click(clicks=2)
-        time.sleep(0.2)
+        pyautogui.click()
+        time.sleep(0.3)
+        # 先全选再替换，确保输入干净
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.1)
-        pyautogui.press("backspace")
-        time.sleep(0.1)
         pyautogui.write(value, interval=0.05)
-        print(f"[Exec] ✅ 输入: '{value}'")
     elif action == "press":
         key = value or "enter"
-        # 处理组合键
-        combo_map = {"win+up": ("win", "up"), "win+d": ("win", "d"),
-                     "alt+tab": ("alt", "tab"), "ctrl+c": ("ctrl", "c"),
-                     "ctrl+v": ("ctrl", "v"), "ctrl+a": ("ctrl", "a")}
-        if key in combo_map:
-            pyautogui.hotkey(*combo_map[key])
-        elif "+" in key:
-            parts = key.split("+")
-            pyautogui.hotkey(*parts)
-        else:
-            try:
-                pyautogui.press(key)
-            except Exception:
-                pass
+        try:
+            pyautogui.press(key)
+        except Exception:
+            pass
 
 
 def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                  use_browser: bool = True,
-                 progress: Callable = None) -> bool:
+                 progress: Callable = None,
+                 hide_window: Callable = None,
+                 show_window: Callable = None) -> bool:
     """
     执行单个步骤。双引擎决策：
     1. Playwright MCP (不影响鼠标，无干扰)
@@ -441,18 +404,7 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         import pyautogui
         key = value or target or "enter"
         key_map = {"回车": "enter", "空格": "space", "tab": "tab", "esc": "escape"}
-        mapped = key_map.get(key, key)
-        print(f"[Exec] 按键: {mapped}")
-
-        # 用 pyautogui.hotkey 确保组合键 + press 确保单键
-        if "+" in mapped:
-            keys = mapped.split("+")
-            pyautogui.hotkey(*keys)
-        else:
-            # 先确保前台窗口获得焦点
-            pyautogui.click(pyautogui.position().x, pyautogui.position().y)
-            pyautogui.press(mapped)
-        time.sleep(0.5)
+        pyautogui.press(key_map.get(key, key))
         return True
 
     # ===== 引擎 1: Playwright MCP（优先，不影响鼠标）=====
@@ -480,7 +432,11 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         except Exception as e:
             print(f"[Exec] Playwright 异常: {e}")
 
-    # ===== 引擎 2: 视觉 + pyautogui（Ai_Flow窗口有防捕获保护，不需要隐藏）=====
+    # ===== 引擎 2: 视觉 + pyautogui（隐藏 Ai_Flow 窗口避免遮挡）=====
+    if hide_window:
+        hide_window()
+        time.sleep(0.3)
+
     try:
         img = _screenshot_desktop()
         if mcp and mcp.connected:
@@ -489,9 +445,12 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
                 img = page_img
 
         pos = vision_locate(desc, img)
+        if show_window:
+            show_window()
 
         if pos and pos.get("found"):
             x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
+            # 用真实屏幕分辨率做坐标映射（不写死 1920×1080）
             import pyautogui
             real_w, real_h = pyautogui.size()
             img_w, img_h = img.size
@@ -506,6 +465,8 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         print(f"[Exec] Vision 未找到: {desc}")
     except Exception as e:
         print(f"[Exec] Vision 异常: {e}")
+        if show_window:
+            show_window()
 
     return False
 
@@ -570,48 +531,22 @@ def audit_result(task: str, image: Image.Image,
 # ============================================================
 
 def run_gui_task(task: str,
-                 use_browser: bool = False,
+                 use_browser: bool = True,  # 默认启用 MCP
                  steps: List[dict] = None,
-                 progress_callback: Callable = None) -> dict:
+                 progress_callback: Callable = None,
+                 hide_window: Callable = None,
+                 show_window: Callable = None) -> dict:
     """完整 RPA 流水线。"""
     mcp = None
     if use_browser:
         mcp = BrowserMCP()
         mcp.connect()
 
-    # Phase 1: Analyze（如果浏览器已开着，跳过 win+r 步骤）
+    # Phase 1: Analyze
     if not steps:
-        if progress_callback:
-            progress_callback("🔍 检查当前状态...")
-        # 截图看当前桌面
-        try:
-            screen_img = _screenshot_desktop()
-            is_open = _check_browser_open(screen_img)
-            if is_open:
-                if progress_callback:
-                    progress_callback("  浏览器已打开，直接执行任务步骤")
-        except Exception:
-            is_open = False
-
         if progress_callback:
             progress_callback("🔍 分析任务...")
         steps = analyze_task(task)
-        # 如果浏览器已开，去掉 win+r 和输网址步骤
-        if is_open and steps:
-            steps = [s for s in steps if s.get("target") != "win+r"]
-            # 同时去掉"输入xxx网址"和"确认打开"（前3步通常是打开浏览器的）
-            filtered = []
-            skip_next = False
-            for s in steps:
-                if s.get("action") == "fill" and ("www." in str(s.get("value","")).lower() or "http" in str(s.get("value","")).lower()):
-                    skip_next = True  # 跳过网址输入 + 下一步的确认按键
-                    continue
-                if skip_next and s.get("action") == "press" and s.get("target") in ("enter", "回车"):
-                    skip_next = False
-                    continue
-                skip_next = False
-                filtered.append(s)
-            steps = filtered
 
     if not steps:
         return {"success": False, "message": "任务分析失败"}
@@ -624,7 +559,8 @@ def run_gui_task(task: str,
         desc = step.get("desc", step.get("target", ""))
         if progress_callback:
             progress_callback(f"[{i+1}/{total}] {desc}")
-        success = execute_step(step, mcp, use_browser, None)
+        success = execute_step(step, mcp, use_browser, None,
+                               hide_window, show_window)
         if success:
             ok += 1
             if progress_callback:
@@ -632,14 +568,6 @@ def run_gui_task(task: str,
         else:
             if progress_callback:
                 progress_callback(f"  ⚠️ {desc} (跳过)")
-        time.sleep(0.5)
-
-    # 浏览器打开后自动最大化
-    if any(s.get("action") == "press" and s.get("target") == "enter" for s in steps):
-        time.sleep(1)
-        print("[Agent] 自动最大化浏览器...")
-        import pyautogui
-        pyautogui.hotkey("win", "up")
         time.sleep(0.5)
 
     # 给操作留出生效时间

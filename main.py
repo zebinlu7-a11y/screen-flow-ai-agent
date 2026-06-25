@@ -617,36 +617,53 @@ class ScreenAIAgent(QObject):
         QTimer.singleShot(0, self._start_gui_agent)
 
     def _start_gui_agent(self):
-        """打开 GUI Agent 命令面板。主线程 QTimer 分片执行。"""
+        """打开 GUI Agent 命令面板。QThread + 信号，不卡 UI。"""
         from gui.gui_agent_panel import GuiAgentDialog
         from agent.gui_agent import run_gui_task
+        from PyQt6.QtCore import QThread, pyqtSignal
 
-        dlg = GuiAgentDialog()
+        class AgentThread(QThread):
+            progress = pyqtSignal(str)
+            done = pyqtSignal(bool, str)
 
-        def on_submit(task: str):
-            dlg._submit_btn.setEnabled(False)
-            dlg._progress.setVisible(True)
-            dlg._progress.setMaximum(0)
+            def __init__(self, task):
+                super().__init__()
+                self._task = task
 
-            # 所有 Qt 操作在主线程，不创建子线程
-            def do_task():
+            def run(self):
                 try:
                     result = run_gui_task(
-                        task=task, use_browser=False,
-                        progress_callback=lambda msg: dlg.set_progress(msg),
+                        task=self._task, use_browser=True,
+                        progress_callback=lambda msg: self.progress.emit(msg),
                     )
                     msg = result.get("message", "")
                     steps = result.get("steps_done", "")
                     if steps:
                         msg = f"[{steps}] {msg}"
-                    dlg.set_done(result.get("success", False), msg)
+                    self.done.emit(result.get("success", False), msg)
                 except Exception as e:
-                    dlg.set_done(False, f"执行异常: {e}")
+                    self.done.emit(False, f"执行异常: {e}")
 
-            QTimer.singleShot(100, do_task)
+        dlg = GuiAgentDialog()
+        thread_holder = {"t": None}
+
+        def on_submit(task: str):
+            dlg._submit_btn.setEnabled(False)
+            dlg._progress.setVisible(True)
+            dlg._progress.setMaximum(0)
+            t = AgentThread(task)
+            t.progress.connect(dlg.set_progress)
+            t.done.connect(dlg.set_done)
+            t.finished.connect(t.deleteLater)
+            t.start()
+            thread_holder["t"] = t
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()
+        # 清理
+        if thread_holder["t"] and thread_holder["t"].isRunning():
+            thread_holder["t"].quit()
+            thread_holder["t"].wait(3000)
 
     def _toggle_speech(self):
         """切换语音识别开关。"""

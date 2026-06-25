@@ -406,7 +406,18 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
         import pyautogui
         key = value or target or "enter"
         key_map = {"回车": "enter", "空格": "space", "tab": "tab", "esc": "escape"}
-        pyautogui.press(key_map.get(key, key))
+        mapped = key_map.get(key, key)
+        print(f"[Exec] 按键: {mapped}")
+
+        # 用 pyautogui.hotkey 确保组合键 + press 确保单键
+        if "+" in mapped:
+            keys = mapped.split("+")
+            pyautogui.hotkey(*keys)
+        else:
+            # 先确保前台窗口获得焦点
+            pyautogui.click(pyautogui.position().x, pyautogui.position().y)
+            pyautogui.press(mapped)
+        time.sleep(0.5)
         return True
 
     # ===== 引擎 1: Playwright MCP（优先，不影响鼠标）=====

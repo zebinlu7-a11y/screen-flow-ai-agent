@@ -57,30 +57,53 @@ class BrowserMCP:
         return False
 
     def connect(self, cdp_url: str = "http://127.0.0.1:9222", auto_launch: bool = True) -> bool:
-        """连接到浏览器 CDP 端口。auto_launch=True 时自动启动浏览器。"""
+        """连接到浏览器 CDP 端口。在独立线程中运行避免 asyncio 冲突。"""
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            print("[MCP] Playwright 未安装: pip install playwright && python -m playwright install chromium")
+            print("[MCP] Playwright 未安装")
             return False
 
-        try:
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
-            self._context = self._browser.contexts[0]
-            self._page = self._context.pages[0] if self._context.pages else None
-            self._connected = bool(self._page)
-            if self._connected:
-                print(f"[MCP] 已连接浏览器: {self._page.title()}")
-            return self._connected
-        except Exception as e:
-            if "ECONNREFUSED" in str(e) or "connect" in str(e).lower():
-                if auto_launch and self.launch_browser():
-                    print("[MCP] 浏览器已启动，重试连接...")
-                    time.sleep(2)
-                    return self.connect(cdp_url, auto_launch=False)
-            print(f"[MCP] 连接失败 (端口 {cdp_url}): {e}")
-            return False
+        # 在独立线程中运行 Playwright，避免与 Qt asyncio 冲突
+        result = {"ok": False}
+
+        def _connect():
+            try:
+                pw = sync_playwright().start()
+                browser = pw.chromium.connect_over_cdp(cdp_url)
+                ctx = browser.contexts[0]
+                page = ctx.pages[0] if ctx.pages else None
+                if page:
+                    self._playwright = pw
+                    self._browser = browser
+                    self._context = ctx
+                    self._page = page
+                    self._connected = True
+                    result["ok"] = True
+                    print(f"[MCP] 已连接: {page.title()}")
+                    # 最大化
+                    try:
+                        page.evaluate("() => { if (window.outerWidth < screen.width) moveTo(0,0); resizeTo(screen.width, screen.height); }")
+                    except Exception:
+                        pass
+            except Exception as e:
+                result["error"] = str(e)
+
+        t = threading.Thread(target=_connect, daemon=True)
+        t.start()
+        t.join(timeout=10)
+
+        if result.get("ok"):
+            return True
+
+        err = result.get("error", "")
+        if ("ECONNREFUSED" in err or "connect" in err.lower() or "TargetClosedError" in err) and auto_launch:
+            if self.launch_browser():
+                print("[MCP] 浏览器已启动，重试...")
+                time.sleep(3)
+                return self.connect(cdp_url, auto_launch=False)
+        print(f"[MCP] 连接失败: {err}")
+        return False
 
     @property
     def page(self):
@@ -483,9 +506,14 @@ def audit_result(task: str, image: Image.Image,
             m = re.search(r'\{.*\}', text, re.DOTALL)
             if m:
                 text = m.group()
-        return json.loads(text.replace("'", '"'))
+        # 清理常见JSON问题
+        text = text.strip()
+        # 修复尾逗号: "need_human": false,} → "need_human": false}
+        text = re.sub(r',\s*}', '}', text)
+        text = re.sub(r',\s*]', ']', text)
+        return json.loads(text)
     except Exception as e:
-        print(f"[Auditor] 解析失败: {e}")
+        print(f"[Auditor] 解析失败(raw): {text[:200]}")
         return {"success": False, "reason": f"审计异常: {e}", "need_human": True}
 
 
@@ -494,7 +522,7 @@ def audit_result(task: str, image: Image.Image,
 # ============================================================
 
 def run_gui_task(task: str,
-                 use_browser: bool = True,  # 默认启用浏览器 MCP
+                 use_browser: bool = False,  # Playwright 与 Qt asyncio 冲突，默认用视觉
                  steps: List[dict] = None,
                  progress_callback: Callable = None,
                  hide_window: Callable = None,

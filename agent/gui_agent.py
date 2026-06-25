@@ -16,7 +16,10 @@ import threading
 from typing import List, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
+import pyautogui  # 主线程导入，避免后台线程跨线程问题
 from PIL import Image
+from agent.llm_client import ChatDoubaoVL  # 主线程导入 LLM 客户端
+from langchain_core.messages import HumanMessage, SystemMessage
 
 
 # ============================================================
@@ -350,7 +353,6 @@ def analyze_task(task: str) -> List[dict]:
 
 def _screenshot_desktop() -> Image.Image:
     """GUI Agent 专用：全桌面截图（pyautogui，稳定可靠）。"""
-    import pyautogui
     return pyautogui.screenshot()
 
 

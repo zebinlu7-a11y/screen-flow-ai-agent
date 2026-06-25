@@ -624,15 +624,13 @@ class ScreenAIAgent(QObject):
         dlg = GuiAgentDialog()
 
         def on_submit(task: str):
-            # 在后台线程执行，避免阻塞 UI
+            self._result_window.hide()  # 隐藏避免截图拍到
             import threading
-
             def run():
                 try:
                     result = run_gui_task(
-                        task=task,
-                        use_browser=True,
-                        progress_callback=lambda msg: QTimer.singleShot(0, lambda m=msg: dlg.set_progress(m)),
+                        task=task, use_browser=False,
+                        progress_callback=lambda msg: dlg.set_progress(msg),
                     )
                     msg = result.get("message", "")
                     steps = result.get("steps_done", "")
@@ -641,7 +639,8 @@ class ScreenAIAgent(QObject):
                     dlg.set_done(result.get("success", False), msg)
                 except Exception as e:
                     dlg.set_done(False, f"执行异常: {e}")
-
+                finally:
+                    self._result_window.show()
             t = threading.Thread(target=run, daemon=True)
             t.start()
 

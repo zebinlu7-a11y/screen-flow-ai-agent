@@ -17,6 +17,8 @@ AIRAG — 智能截图解析悬浮窗工具 主入口
 import sys
 import os
 import json
+import time
+import threading
 
 # Qt 高 DPI 支持
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
@@ -56,6 +58,7 @@ from agent.graph import build_graph, stream_graph
 from agent.llm_client import build_multimodal_message
 from gui.capture_window import CaptureWindow
 from gui.result_window import ResultWindow
+from remote.server import RemoteServer, get_connection_urls, stop_ngrok_tunnel, stop_cloudflare_tunnel
 
 
 # ============================================================
@@ -233,6 +236,178 @@ class DesktopAgentProcessThread(QThread):
             self.done.emit(False, f"进程异常: {e}")
 
 
+class _RemoteAgentThread(QThread):
+    """远程控制多轮 Agent: 子进程常驻, 通过 stdin/stdout 收发多轮任务."""
+
+    progress = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, task: str, remote_server, use_mcp: bool = False):
+        super().__init__()
+        self._task = task
+        self._use_mcp = use_mcp
+        self._remote = remote_server
+        self._proc = None
+        self._cancel_file = ""
+        self._stop_event = threading.Event()
+        # 多轮任务队列 (线程安全)
+        import queue
+        self._task_queue = queue.Queue()
+
+    def send_task(self, task: str):
+        """发送新任务给正在运行的 Agent (线程安全)."""
+        self._task_queue.put(task)
+
+    def stop_agent(self):
+        """停止 Agent."""
+        self._stop_event.set()
+        self._task_queue.put(None)  # 唤醒等待的线程
+
+    def cancel(self):
+        if self._cancel_file and not os.path.exists(self._cancel_file):
+            try:
+                with open(self._cancel_file, "w") as f:
+                    f.write("cancel")
+            except Exception:
+                pass
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write("STOP\n")
+                self._proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self._proc.terminate()
+                time.sleep(0.3)
+                if self._proc.poll() is None:
+                    self._proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        import subprocess as _sp
+        import tempfile as _tf
+        import time as _time
+
+        self._cancel_file = _tf.mktemp(suffix=".cancel", prefix="airag_cancel_")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent", "run_gui_agent.py")
+
+        from config import GUI_AGENT_PYTHON
+        python = GUI_AGENT_PYTHON or sys.executable
+
+        # 结果保存到项目目录
+        save_dir = os.path.dirname(os.path.dirname(os.path.abspath(script)))
+
+        cmd = [python, script, self._task, "--keep-browser", "--save-dir", save_dir]
+        if self._use_mcp:
+            cmd.append("--mcp")
+        cmd.extend(["--cancel-file", self._cancel_file])
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        self._proc = _sp.Popen(
+            cmd, stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env,
+        )
+
+        # 读取第一轮结果
+        self._read_and_emit_result()
+
+        # 多轮循环: 等待新任务 → 发送 → 读结果
+        while not self._stop_event.is_set():
+            try:
+                next_task = self._task_queue.get(timeout=0.5)
+            except Exception:
+                # queue.Empty or timeout
+                if self._proc.poll() is not None:
+                    break  # 子进程已退出
+                continue
+
+            if next_task is None:
+                break  # stop signal
+
+            # 发送任务到子进程
+            try:
+                self._proc.stdin.write(next_task + "\n")
+                self._proc.stdin.flush()
+                self._remote.send_progress(f"📨 收到指令: {next_task}")
+            except Exception:
+                break
+
+            # 读取结果
+            self._read_and_emit_result()
+
+        # 清理: 通知子进程退出
+        try:
+            self._proc.stdin.write("STOP\n")
+            self._proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=3)
+        except Exception:
+            self._proc.kill()
+
+        if self._cancel_file and os.path.exists(self._cancel_file):
+            try:
+                os.remove(self._cancel_file)
+            except Exception:
+                pass
+
+    def _read_and_emit_result(self):
+        """从子进程 stdout 读取结果 JSON 直到 READY 标记，然后发射 done 信号。"""
+        lines = []
+        result = None
+
+        for line in self._proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 转发进度信息
+            for prefix in ["[进度] ", "[Exec] ", "[Analyzer] ", "[ReAct] ", "[Cancelled] ", "[Vision] "]:
+                if prefix in line:
+                    msg = line.split(prefix, 1)[-1].strip()
+                    self._remote.send_progress(msg)
+                    self.progress.emit(msg)
+                    break
+            else:
+                if "[Agent进程]" in line:
+                    msg = line.split("[Agent进程]", 1)[-1].strip()
+                    self._remote.send_progress(msg)
+                    self.progress.emit(msg)
+                elif "[MCP]" in line:
+                    self._remote.send_progress(line)
+                    self.progress.emit(line)
+                elif line == "READY":
+                    # 子进程准备就绪，可以接收下一个任务
+                    break
+                else:
+                    # 可能是结果 JSON
+                    lines.append(line)
+
+        # 解析最后一条有效 JSON 作为结果
+        for line in reversed(lines):
+            try:
+                result = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+
+        if result:
+            success = result.get("success", False)
+            msg = result.get("message", "")
+            steps = result.get("steps_done", "")
+            elapsed = result.get("elapsed", "")
+            if steps:
+                msg = f"[{steps}] {msg}"
+            if elapsed:
+                msg = f"({elapsed}) {msg}"
+            self._remote.send_result(success, msg, elapsed)
+            self.done.emit(success, msg)
+
+
 # ============================================================
 # Main Agent Controller
 # ============================================================
@@ -316,6 +491,16 @@ class ScreenAIAgent(QObject):
 
         # 注册快捷键
         self._register_hotkey()
+
+        # 后台截图推送(手机远程控制, 1.5s 间隔)
+        self._screen_pusher_stop = threading.Event()
+        self._screen_pusher_thread = threading.Thread(
+            target=self._screen_pusher_loop, daemon=True)
+        self._screen_pusher_thread.start()
+
+        # 远程控制服务（手机远程控制 PC）
+        self._remote_server: Optional[RemoteServer] = None
+        self._init_remote_server()
 
         # 延迟启动 API Key 检查（等 QApplication 事件循环就绪）
         QTimer.singleShot(500, self._check_api_key)
@@ -426,8 +611,24 @@ class ScreenAIAgent(QObject):
             self._privacy_action.setText("👁️ 屏幕共享可见 (当前: 隐藏)")
 
     def _quit_app(self):
-        """退出程序 — 保存对话 + 提取记忆。"""
+        """退出程序 — 保存对话 + 提取记忆 + 停止远程服务。"""
         print("[AIRAG] 正在退出...")
+        # 停止截图推送线程
+        self._screen_pusher_stop.set()
+        # 停止远程控制服务 + 隧道
+        try:
+            stop_ngrok_tunnel()
+        except Exception:
+            pass
+        try:
+            stop_cloudflare_tunnel()
+        except Exception:
+            pass
+        if self._remote_server:
+            try:
+                self._remote_server.stop()
+            except Exception:
+                pass
         # 保存对话
         self._save_current_conv()
         set_active_conversation_id(self._user_id, self._active_conv_id)
@@ -724,26 +925,64 @@ class ScreenAIAgent(QObject):
         self._agent_thread.start()
 
     def _cancel_desktop_automation(self):
-        """ESC 回调：立即取消当前正在执行的桌面自动化操作。"""
+        """ESC 回调：取消当前操作 / 停止远程 Agent。"""
         thread = getattr(self, "_agent_thread", None)
         if thread and thread.isRunning():
-            self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
-            thread.cancel()
+            if hasattr(thread, "stop_agent"):
+                # 多轮远程 Agent: 停止整个会话
+                self._result_window.append_text("\n⏹️ **远程会话已终止**\n")
+                thread.stop_agent()
+                self._agent_thread = None
+                self._remote_session = False
+            else:
+                self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
+                thread.cancel()
+                self._agent_thread = None
         else:
             self._result_window.append_text("\n⚠️ 当前没有正在执行的自动化操作。\n")
+
+    def _screen_pusher_loop(self):
+        """后台线程：持续截图推送给手机。"""
+        import pyautogui as _pg
+        while not self._screen_pusher_stop.is_set():
+            try:
+                if self._remote_server:
+                    img = _pg.screenshot()
+                    self._remote_server.set_screenshot(img)
+            except Exception:
+                pass
+            self._screen_pusher_stop.wait(1.5)
 
     def _on_desktop_agent_progress(self, msg: str):
         self._agent_log_lines.append(msg)
         if self._result_window:
             self._result_window.append_text(f"- {msg}\n")
+        # 转发到手机远程
+        if self._remote_server:
+            self._remote_server.send_progress(msg)
             self._result_window.show()
             self._result_window.raise_()
 
     def _on_desktop_agent_done(self, success: bool, msg: str):
+        # 清理
+        self._agent_thread = None
         if self._result_window:
             self._result_window.stop_loading()
             status = "完成" if success else "失败"
             self._result_window.append_text(f"\n**{status}：** {msg}\n")
+
+        # 向远程手机发送结果
+        if self._remote_server:
+            elapsed = ""
+            try:
+                # 尝试从 msg 提取耗时
+                import re as _re
+                m = _re.search(r'\((\d+\.\d+)s\)', msg)
+                if m:
+                    elapsed = m.group(1) + "s"
+            except Exception:
+                pass
+            self._remote_server.send_result(success, msg, elapsed)
 
         user_msg = HumanMessage(content=self._last_user_text)
         log_text = "\n".join(self._agent_log_lines[-20:]) if hasattr(self, "_agent_log_lines") else ""
@@ -755,7 +994,9 @@ class ScreenAIAgent(QObject):
         self._messages.append(assistant_msg)
         self._save_current_conv()
         self._last_user_text = ""
-        self._agent_thread = None
+        # 远程会话保持线程不释放, 等下一轮指令复用
+        if not getattr(self, "_remote_session", False):
+            self._agent_thread = None
 
     def _on_stream_finished(self):
         full_response = ""
@@ -862,6 +1103,108 @@ class ScreenAIAgent(QObject):
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()
+
+    # ============================================================
+    # 远程控制 (手机 → PC)
+    # ============================================================
+
+    def _init_remote_server(self):
+        """启动手机远程控制 HTTP/WebSocket 服务。"""
+        try:
+            from config import REMOTE_PORT
+            port = REMOTE_PORT
+        except ImportError:
+            port = 8765
+
+        self._remote_pending_task: Optional[str] = None  # 手机发来的待处理指令
+
+        self._remote_server = RemoteServer(port=port)
+        self._remote_server.on_command = self._on_remote_command
+        self._remote_server.on_cancel = self._on_remote_cancel
+        self._remote_server.start()
+
+        # 主线程定时检查: 处理手机指令 + 截图推送
+        self._remote_check_timer = QTimer()
+        self._remote_check_timer.timeout.connect(self._remote_tick)
+        self._remote_check_timer.start(1000)  # 每秒检查一次
+
+        # 在悬浮窗显示连接信息
+        self._show_remote_connection_info()
+
+    def _remote_tick(self):
+        """主线程定时: 检查手机指令 + 推截图."""
+        # 处理手机发来的指令
+        task = self._remote_pending_task
+        if task:
+            self._remote_pending_task = None
+            self._run_remote_task(task)
+
+        # 截图推送 (仅agent运行时)
+        if self._remote_server and getattr(self, "_agent_thread", None) and self._agent_thread.isRunning():
+            try:
+                import pyautogui
+                img = pyautogui.screenshot()
+                self._remote_server.set_screenshot(img)
+            except Exception:
+                pass
+
+    def _run_remote_task(self, task: str):
+        """主线程: 执行手机发来的指令."""
+        thread = getattr(self, "_agent_thread", None)
+        if thread and thread.isRunning():
+            self._remote_server.send_progress("⚠️ 上一个任务还在执行中, 请稍后再试")
+            return
+        print(f"[Remote] 执行: {task}")
+        self._remote_server.send_progress(f"执行: {task}")
+        self._run_desktop_automation(task, original_text=task)
+
+    def _push_remote_screenshot(self):
+        """截图推送给远程手机."""
+        if not self._remote_server:
+            return
+        try:
+            import pyautogui
+            img = pyautogui.screenshot()
+            self._remote_server.set_screenshot(img)
+        except Exception:
+            pass
+
+    def _show_remote_connection_info(self):
+        """在悬浮窗/日志中显示远程连接地址和 QR 码。"""
+        try:
+            from config import REMOTE_PORT
+            port = REMOTE_PORT
+        except ImportError:
+            port = 8765
+
+        # ngrok token: 环境变量 > config > 空(跳过)
+        ngrok_token = os.environ.get("NGROK_AUTH_TOKEN", "")
+        if not ngrok_token:
+            try:
+                from config import NGROK_AUTH_TOKEN
+                ngrok_token = NGROK_AUTH_TOKEN
+            except ImportError:
+                pass
+
+        urls = get_connection_urls(port, ngrok_token=ngrok_token)
+        if urls:
+            lines = ["\n📱 **手机远程控制**\n"]
+            for u in urls:
+                lines.append(f"- {u['label']}: {u['url']}")
+            lines.append(f"\n手机浏览器打开上述地址即可远程控制。")
+            self._result_window.append_text("\n".join(lines))
+            print(f"[Remote] 连接信息: {[(u['label'], u['url']) for u in urls]}")
+        else:
+            print("[Remote] 未检测到局域网 IP")
+
+    def _on_remote_command(self, task: str):
+        """手机发来指令 → 设置标记, 主线程定时检查并处理."""
+        self._remote_pending_task = task
+        self._remote_server.send_progress(f"📨 已收到: {task}")
+
+    def _on_remote_cancel(self):
+        """手机发来取消信号。"""
+        QTimer.singleShot(0, self._cancel_desktop_automation)
 
     def _toggle_speech(self):
         """切换语音识别开关。"""

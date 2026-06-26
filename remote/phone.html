@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Ai_Flow Remote</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#1a1a2e;color:#e0e0e0;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+.header{background:#16213e;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.header h1{font-size:18px;color:#00d4ff}
+.header .status{font-size:12px;color:#888;background:#0f3460;padding:4px 10px;border-radius:12px}
+.screen-area{flex:1;display:flex;align-items:center;justify-content:center;background:#0f0f1a;position:relative;min-height:0;overflow:hidden}
+.screen-area img{max-width:100%;max-height:100%;object-fit:contain;border:1px solid #333}
+.screen-area .placeholder{color:#555;font-size:14px;text-align:center}
+.log-area{max-height:120px;overflow-y:auto;background:#0d0d1a;border-top:1px solid #2a2a4a;padding:8px 12px;font-size:12px;font-family:monospace;flex-shrink:0}
+.log-area .log-line{margin:2px 0;color:#aaa}
+.log-area .log-line.ok{color:#4caf50}
+.log-area .log-line.err{color:#f44336}
+.input-bar{display:flex;padding:8px 12px;gap:8px;background:#16213e;flex-shrink:0}
+.input-bar input{flex:1;padding:10px 14px;border-radius:20px;border:none;background:#0f3460;color:#fff;font-size:15px;outline:none}
+.input-bar input::placeholder{color:#666}
+.input-bar button{padding:10px 18px;border-radius:20px;border:none;font-size:15px;font-weight:600;cursor:pointer;flex-shrink:0}
+.btn-send{background:#00d4ff;color:#000}
+.btn-cancel{background:#ff4444;color:#fff}
+.btn-send:active{opacity:.7}
+.btn-cancel:active{opacity:.7}
+.btn-send:disabled,.btn-cancel:disabled{opacity:.4}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🖥️ Ai_Flow</h1>
+  <span class="status" id="status">连接中...</span>
+</div>
+
+<div class="screen-area" id="screenArea">
+  <span class="placeholder" id="placeholder">等待连接...</span>
+  <img id="screenshot" style="display:none" alt="截图">
+</div>
+
+<div class="log-area" id="logArea"></div>
+
+<div class="input-bar">
+  <input type="text" id="cmdInput" placeholder="输入指令, 如: 打开百度搜索python" autocomplete="off">
+  <button class="btn-send" id="btnSend" onclick="sendCommand()">发送</button>
+  <button class="btn-cancel" id="btnCancel" onclick="cancelTask()">取消</button>
+</div>
+
+<script>
+const HOST = location.host;
+let lastLogId = 0;
+let lastImgTime = '';
+let connected = false;
+let pollTimer = null;
+
+function connect() {
+  setStatus('连接中...');
+  // 测一下 PC 是否可达
+  fetch('/api/status').then(r => r.json()).then(d => {
+    connected = true;
+    setStatus('就绪');
+    log('✅ 已连接到 PC');
+    startPolling();
+  }).catch(() => {
+    setStatus('断开');
+    log('⚠️ 连接失败，3秒后重试...', false);
+    setTimeout(connect, 3000);
+  });
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 1500);
+}
+
+function poll() {
+  fetch('/api/updates?since=' + lastLogId).then(r => r.json()).then(data => {
+    // 进度日志
+    if (data.logs && data.logs.length > 0) {
+      data.logs.forEach(l => log(l.text, l.ok));
+      lastLogId = data.last_id || lastLogId;
+    }
+    // 截图
+    if (data.screenshot && data.img_time !== lastImgTime) {
+      lastImgTime = data.img_time;
+      const img = document.getElementById('screenshot');
+      img.src = 'data:image/jpeg;base64,' + data.screenshot;
+      img.style.display = 'block';
+      document.getElementById('placeholder').style.display = 'none';
+    }
+    // 结果
+    if (data.result) {
+      log(data.result.success ? '✅ ' + data.result.message : '❌ ' + data.result.message, data.result.success);
+      setStatus(data.result.success ? '完成' : '失败');
+      enableButtons(true);
+    }
+    // 状态
+    if (data.state) setStatus(data.state);
+    if (!connected) { connected = true; setStatus('就绪'); }
+  }).catch(() => {
+    if (connected) { connected = false; setStatus('断开'); log('连接断开，重连中...', false); }
+  });
+}
+
+function sendCommand() {
+  const input = document.getElementById('cmdInput');
+  const text = input.value.trim();
+  if (!text) return;
+  fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})})
+    .then(r => r.json()).then(d => {
+      log('📨 ' + text);
+      input.value = '';
+      enableButtons(false);
+      // 立即轮询一次
+      poll();
+    }).catch(() => log('⚠️ 发送失败', false));
+}
+
+function cancelTask() {
+  fetch('/api/cancel', {method:'POST'}).then(r => r.json()).then(() => {
+    log('⏹️ 已发送取消信号');
+  }).catch(() => log('⚠️ 取消失败', false));
+}
+
+function log(text, isOk) {
+  const area = document.getElementById('logArea');
+  const cls = isOk === true ? 'ok' : (isOk === false ? 'err' : '');
+  area.innerHTML += `<div class="log-line ${cls}">${text}</div>`;
+  area.scrollTop = area.scrollHeight;
+}
+
+function setStatus(s) { document.getElementById('status').textContent = s; }
+function enableButtons(enabled) { document.getElementById('btnSend').disabled = !enabled; }
+
+document.getElementById('cmdInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendCommand();
+});
+
+connect();
+</script>
+</body>
+</html>

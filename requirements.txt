@@ -12,3 +12,5 @@ six
 sniffio
 python-dateutil
 tencentcloud-sdk-python-ocr
+aiohttp>=3.9.0
+qrcode[pil]>=7.4

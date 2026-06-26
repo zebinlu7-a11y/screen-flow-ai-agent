@@ -38,19 +38,20 @@ class ChatDoubaoVL(BaseChatModel):
 
     model_name: str = Field(default="")
     api_key: str = Field(default="")
-    base_url: str = Field(default=ARK_BASE_URL)
+    base_url: str = Field(default="")
     temperature: float = Field(default=0.7)
 
     _client: OpenAI = PrivateAttr()
 
     def __init__(self, **kwargs):
-        # Read the API key at construction time so settings changed in the UI
-        # are picked up by newly-created model instances.
-        from config import ARK_API_KEY
-
-        if "api_key" not in kwargs:
-            kwargs["api_key"] = ARK_API_KEY
+        from config import ARK_API_KEY, ARK_BASE_URL
+        kwargs.setdefault("api_key", ARK_API_KEY)
+        kwargs.setdefault("base_url", ARK_BASE_URL)
+        kwargs.setdefault("model_name", "")
+        kwargs.setdefault("temperature", 0.7)
         super().__init__(**kwargs)
+        # Pydantic v1 compat fix: 确保所有 field 值是原生 Python 类型
+        object.__setattr__(self, "temperature", float(kwargs["temperature"]))
         self._create_client()
 
     def _create_client(self):

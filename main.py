@@ -16,6 +16,7 @@ AIRAG — 智能截图解析悬浮窗工具 主入口
 """
 import sys
 import os
+import json
 
 # Qt 高 DPI 支持
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
@@ -68,12 +69,14 @@ class StreamWorker(QThread):
 
     def __init__(self, graph, messages: List[BaseMessage],
                  user_text: str, image_base64_list: Optional[List[str]],
+                 user_id: str,
                  parent=None):
         super().__init__(parent)
         self._graph = graph
         self._messages = messages
         self._user_text = user_text
         self._image_base64_list = image_base64_list or []
+        self._user_id = user_id
 
     def run(self):
         try:
@@ -97,6 +100,137 @@ class StreamWorker(QThread):
             self.stream_error.emit(str(e))
         finally:
             loop.close()
+
+
+def _is_browser_automation_task(task: str) -> bool:
+    text = (task or "").lower()
+    keywords = (
+        "浏览器", "网页", "网址", "网站", "http://", "https://", "www.",
+        "百度", "搜索", "google", "bing", "edge", "chrome", "打开网页",
+        "b站", "bilibili", "淘宝", "京东", "知乎", "微博",
+    )
+    return any(k in text for k in keywords)
+
+
+class DesktopAgentProcessThread(QThread):
+    """Run the GUI automation agent in a separate Python process."""
+
+    progress = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, task: str, use_mcp: bool = False):
+        super().__init__()
+        self._task = task
+        self._use_mcp = use_mcp
+        self._proc = None          # subprocess handle for termination
+        self._cancel_file = ""     # signal file to tell agent to stop
+
+    def cancel(self):
+        """Terminate the agent subprocess immediately."""
+        # Write cancel signal file so agent can exit cleanly between steps
+        if self._cancel_file and not os.path.exists(self._cancel_file):
+            try:
+                with open(self._cancel_file, "w") as f:
+                    f.write("cancel")
+            except Exception:
+                pass
+        # Force kill the subprocess
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+                time.sleep(0.3)
+                if self._proc.poll() is None:
+                    self._proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        import subprocess
+        import tempfile
+
+        try:
+            result_file = tempfile.mktemp(suffix=".json", prefix="airag_")
+            self._cancel_file = tempfile.mktemp(suffix=".cancel", prefix="airag_cancel_")
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent", "run_gui_agent.py")
+
+            from config import GUI_AGENT_PYTHON
+            python = GUI_AGENT_PYTHON or sys.executable
+
+            cmd = [python, script, self._task, "--result", result_file]
+            if self._use_mcp:
+                cmd.append("--mcp")
+            cmd.extend(["--cancel-file", self._cancel_file])
+
+            self.progress.emit(f"启动独立 Agent 进程: {python}")
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if "[进度]" in line:
+                    self.progress.emit(line.split("[进度]", 1)[-1].strip())
+                elif "[Agent进程]" in line:
+                    msg = line.split("[Agent进程]", 1)[-1].strip()
+                    if not msg.startswith("完成"):
+                        self.progress.emit(msg)
+                elif "[MCP]" in line or "[Exec]" in line or "[Analyzer]" in line:
+                    self.progress.emit(line)
+                elif "[Cancelled]" in line:
+                    self.progress.emit("⏹️ 操作已被用户取消 (ESC)")
+                else:
+                    self.progress.emit(line)
+
+            self._proc.wait()
+
+            # Clean up cancel file
+            if self._cancel_file and os.path.exists(self._cancel_file):
+                try:
+                    os.remove(self._cancel_file)
+                except Exception:
+                    pass
+
+            time_waited = 0
+            while not os.path.exists(result_file) and time_waited < 5:
+                self.msleep(200)
+                time_waited += 0.2
+
+            if os.path.exists(result_file):
+                try:
+                    with open(result_file, "r", encoding="utf-8") as f:
+                        result = json.load(f)
+                except json.JSONDecodeError:
+                    result = {"success": False, "message": "结果文件损坏"}
+            else:
+                canceled = self._proc.returncode != 0
+                result = {
+                    "success": False,
+                    "canceled": canceled,
+                    "message": "操作已取消 (ESC)" if canceled else f"进程退出(code={self._proc.returncode})，无结果文件",
+                }
+
+            msg = result.get("message", "")
+            steps = result.get("steps_done", "")
+            if steps:
+                msg = f"[{steps}] {msg}"
+            elapsed = result.get("elapsed", "")
+            if elapsed:
+                msg = f"({elapsed}) {msg}"
+            self.done.emit(result.get("success", False), msg)
+
+        except Exception as e:
+            self.done.emit(False, f"进程异常: {e}")
 
 
 # ============================================================
@@ -156,6 +290,9 @@ class ScreenAIAgent(QObject):
         self._result_window.follow_up_requested.connect(self._on_follow_up)
         self._result_window.model_changed.connect(self._on_model_changed)
         self._result_window.settings_requested.connect(self._change_api_key)
+        self._result_window.mode_changed.connect(self._on_mode_changed)
+        self._mode = "operate"
+        self._result_window.set_mode(self._mode)
         # 侧边栏：内嵌在 ResultWindow 中
         self._result_window.set_sidebar_listener(
             on_select=self._on_conv_selected,
@@ -167,6 +304,7 @@ class ScreenAIAgent(QObject):
         self._result_window.show()
         self._stream_worker: Optional[StreamWorker] = None
         self._capture_win: Optional[CaptureWindow] = None
+        self._browser_warmup_thread: Optional[DesktopAgentProcessThread] = None
 
         # 本轮输入追踪
         self._last_user_text = ""
@@ -181,6 +319,15 @@ class ScreenAIAgent(QObject):
 
         # 延迟启动 API Key 检查（等 QApplication 事件循环就绪）
         QTimer.singleShot(500, self._check_api_key)
+
+    def _on_mode_changed(self, mode: str):
+        self._mode = "chat" if mode == "chat" else "operate"
+        if self._mode == "chat":
+            self._result_window.show()
+            self._result_window.raise_()
+            print("[AIRAG] 已切换到问答模式")
+        else:
+            print("[AIRAG] 已切换到操作模式")
 
     # ============================================================
     # System Tray
@@ -309,6 +456,7 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+y': self._on_speech_hotkey,
                 '<ctrl>+g': self._on_gui_agent_hotkey,
                 '<ctrl>+q': self._on_quit_hotkey,
+                '<esc>': self._on_esc_hotkey,
             }
             self._hotkey_listener = pynput_keyboard.GlobalHotKeys(
                 hotkeys, suppress=False)  # suppress=False 让 Ctrl+Z 等正常传递
@@ -490,6 +638,7 @@ class ScreenAIAgent(QObject):
             messages=list(self._messages),  # 传全部历史，检索模块智能选取
             user_text=user_text,
             image_base64_list=image_base64_list,
+            user_id=self._user_id,
         )
         self._stream_worker.token_received.connect(self._on_token_received)
         self._stream_worker.stream_finished.connect(self._on_stream_finished)
@@ -523,9 +672,90 @@ class ScreenAIAgent(QObject):
         if not text.strip() and not self._last_image_b64_list:
             return
 
+        automation_task = self._extract_automation_task(text)
+        if self._mode == "operate" and text.strip() and not self._last_image_b64_list:
+            automation_task = automation_task or text.strip()
+
+        if automation_task and not self._last_image_b64_list:
+            self._result_window.clear_input()
+            self._run_desktop_automation(automation_task, original_text=text)
+            return
+
         self._last_user_text = text
         self._result_window.clear_input()
         self._run_ai_stream(text, image_base64_list=self._last_image_b64_list)
+
+    def _extract_automation_task(self, text: str) -> str:
+        """Route explicit desktop-operation commands from the main chat box."""
+        stripped = (text or "").strip()
+        prefixes = ("自动 ", "自动：", "自动:", "操作 ", "操作：", "操作:", "执行 ", "执行：", "执行:", "/agent ")
+        for prefix in prefixes:
+            if stripped.lower().startswith(prefix.lower()):
+                return stripped[len(prefix):].strip()
+        return ""
+
+    def _run_desktop_automation(self, task: str, original_text: str = ""):
+        if not task:
+            return
+
+        if getattr(self, "_agent_thread", None) and self._agent_thread.isRunning():
+            self._result_window.append_text("\n\n**桌面助手正在执行上一个任务，请稍后再试。**\n")
+            return
+
+        existing = self._result_window.get_content()
+        separator = "\n\n---\n\n" if existing.strip() else ""
+        shown_text = original_text or f"自动 {task}"
+        self._result_window.set_content(
+            existing + separator + f"**🖥️ 你：** {shown_text}\n\n**桌面助手：**\n\n**实时进度：**\n"
+        )
+        self._result_window.start_loading("桌面助手正在操作")
+        self._result_window.show()
+        self._result_window.raise_()
+
+        self._last_user_text = shown_text
+        self._agent_log_lines = []
+        use_mcp = _is_browser_automation_task(task)
+        mode_text = "浏览器自动化 + 视觉保底" if use_mcp else "纯视觉/鼠标键盘"
+        self._result_window.append_text(f"- 模式：{mode_text}\n")
+        self._agent_log_lines.append(f"模式：{mode_text}")
+        self._agent_thread = DesktopAgentProcessThread(task, use_mcp=use_mcp)
+        self._agent_thread.progress.connect(self._on_desktop_agent_progress)
+        self._agent_thread.done.connect(self._on_desktop_agent_done)
+        self._agent_thread.start()
+
+    def _cancel_desktop_automation(self):
+        """ESC 回调：立即取消当前正在执行的桌面自动化操作。"""
+        thread = getattr(self, "_agent_thread", None)
+        if thread and thread.isRunning():
+            self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
+            thread.cancel()
+        else:
+            self._result_window.append_text("\n⚠️ 当前没有正在执行的自动化操作。\n")
+
+    def _on_desktop_agent_progress(self, msg: str):
+        self._agent_log_lines.append(msg)
+        if self._result_window:
+            self._result_window.append_text(f"- {msg}\n")
+            self._result_window.show()
+            self._result_window.raise_()
+
+    def _on_desktop_agent_done(self, success: bool, msg: str):
+        if self._result_window:
+            self._result_window.stop_loading()
+            status = "完成" if success else "失败"
+            self._result_window.append_text(f"\n**{status}：** {msg}\n")
+
+        user_msg = HumanMessage(content=self._last_user_text)
+        log_text = "\n".join(self._agent_log_lines[-20:]) if hasattr(self, "_agent_log_lines") else ""
+        assistant_content = f"桌面助手执行{'成功' if success else '失败'}：{msg}"
+        if log_text:
+            assistant_content += f"\n\n执行日志：\n{log_text}"
+        assistant_msg = AIMessage(content=assistant_content)
+        self._messages.append(user_msg)
+        self._messages.append(assistant_msg)
+        self._save_current_conv()
+        self._last_user_text = ""
+        self._agent_thread = None
 
     def _on_stream_finished(self):
         full_response = ""
@@ -612,6 +842,10 @@ class ScreenAIAgent(QObject):
         """Ctrl+Y → 开始/停止语音识别。"""
         QTimer.singleShot(0, self._toggle_speech)
 
+    def _on_esc_hotkey(self, key=None):
+        """ESC → 立即终止当前 GUI Agent 操作。"""
+        QTimer.singleShot(0, self._cancel_desktop_automation)
+
     def _on_gui_agent_hotkey(self, key=None):
         """Ctrl+G → GUI Agent 自动化操作。"""
         QTimer.singleShot(0, self._start_gui_agent)
@@ -619,90 +853,12 @@ class ScreenAIAgent(QObject):
     def _start_gui_agent(self):
         """GUI Agent 独立进程 — 不阻塞 UI，不受 Qt 限制。"""
         from gui.gui_agent_panel import GuiAgentDialog
-        from PyQt6.QtCore import QThread, pyqtSignal
-        import subprocess, tempfile, os, sys
-
-        class AgentProcessThread(QThread):
-            progress = pyqtSignal(str)
-            done = pyqtSignal(bool, str)
-
-            def __init__(self, task, use_mcp=False):
-                super().__init__()
-                self._task = task
-                self._use_mcp = use_mcp
-
-            def run(self):
-                try:
-                    # 写结果到临时文件
-                    result_file = tempfile.mktemp(suffix=".json", prefix="airag_")
-                    script = os.path.join(os.path.dirname(os.path.dirname(
-                        os.path.abspath(__file__))), "agent", "run_gui_agent.py")
-                    python = sys.executable
-
-                    cmd = [python, script, self._task, "--result", result_file]
-                    if self._use_mcp:
-                        cmd.append("--mcp")
-
-                    self.progress.emit("🚀 启动独立进程...")
-                    env = os.environ.copy()
-                    env["PYTHONIOENCODING"] = "utf-8"
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, encoding="utf-8", errors="replace", env=env)
-
-                    # 实时读取 stdout 作为进度
-                    for line in proc.stdout:
-                        line = line.strip()
-                        if line:
-                            # 提取进度/日志
-                            if "[进度]" in line:
-                                msg = line.split("[进度]", 1)[-1].strip()
-                                self.progress.emit(msg)
-                            elif "[Agent进程]" in line:
-                                msg = line.split("[Agent进程]", 1)[-1].strip()
-                                if not msg.startswith("完成"):
-                                    self.progress.emit(msg)
-
-                    proc.wait()
-
-                    # 读结果（等文件写入完成）
-                    time_waited = 0
-                    while not os.path.exists(result_file) and time_waited < 5:
-                        self.msleep(200)
-                        time_waited += 0.2
-
-                    if os.path.exists(result_file):
-                        try:
-                            with open(result_file, "r", encoding="utf-8") as f:
-                                result = json.load(f)
-                        except json.JSONDecodeError:
-                            result = {"success": False, "message": "结果文件损坏"}
-                    else:
-                        result = {"success": False, "message": f"进程退出(code={proc.returncode})，无结果文件"}
-
-                    msg = result.get("message", "")
-                    steps = result.get("steps_done", "")
-                    if steps:
-                        msg = f"[{steps}] {msg}"
-                    elapsed = result.get("elapsed", "")
-                    if elapsed:
-                        msg = f"({elapsed}) {msg}"
-                    self.done.emit(result.get("success", False), msg)
-
-                except Exception as e:
-                    self.done.emit(False, f"进程异常: {e}")
 
         dlg = GuiAgentDialog()
-        self._agent_thread = None  # 保持引用防止 GC 回收导致崩溃
 
         def on_submit(task: str):
-            dlg._submit_btn.setEnabled(False)
-            dlg._progress.setVisible(True)
-            dlg._progress.setMaximum(0)
-            dlg.set_progress("启动独立 Agent 进程...")
-            self._agent_thread = AgentProcessThread(task, use_mcp=True)
-            self._agent_thread.progress.connect(dlg.set_progress)
-            self._agent_thread.done.connect(dlg.set_done)
-            self._agent_thread.start()
+            dlg.accept()
+            self._run_desktop_automation(task, original_text=f"自动 {task}")
 
         dlg.task_submitted.connect(on_submit)
         dlg.exec()

@@ -37,3 +37,8 @@ Thumbs.db
 *.manifest
 dist_new/
 dist_final/
+
+# MCP / Playwright temp
+.playwright-mcp/
+*.tgz
+airag-page.png

@@ -3,10 +3,12 @@ langgraph>=0.2.0
 langchain-core>=0.2.0
 pillow>=10.0.0
 pynput>=1.7
+openai>=1.0.0
+playwright>=1.45.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
 httpx
 six
 sniffio
 python-dateutil
 tencentcloud-sdk-python-ocr
-# 火山引擎 SDK — 见下方安装说明
-# volcenginesdkarkruntime  # 需从 https://pypi.org 或火山引擎官方获取

@@ -26,6 +26,31 @@ ARK_API_KEY = get_api_key() or os.environ.get("ARK_API_KEY", "")
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DOUBAO_MODEL_NAME = get_model() or os.environ.get("DOUBAO_MODEL_NAME", "doubao-seed-2-0-mini-260428")
 
+# GUI 自动化子进程解释器。主界面需要 PyQt/pynput，自动化进程优先使用 browser-use 环境。
+_BROWSER_USE_PYTHON = r"E:\Anaconda3\envs\browser-use\python.exe"
+GUI_AGENT_PYTHON = (
+    os.environ.get("AIRAG_GUI_AGENT_PYTHON")
+    or (_BROWSER_USE_PYTHON if os.path.exists(_BROWSER_USE_PYTHON) else "")
+)
+
+# ============================================================
+# Playwright MCP Server 配置
+# ============================================================
+# 官方版优先，旧社区版作为兜底
+# 通过 npx 启动，JSON-RPC 2.0 over stdio 通信
+MCP_SERVER_PACKAGE = os.environ.get("AIRAG_MCP_SERVER_PACKAGE", "@playwright/mcp")
+MCP_SERVER_FALLBACK_PACKAGE = "@executeautomation/playwright-mcp-server"
+MCP_SERVER_PACKAGES = [
+    MCP_SERVER_PACKAGE,
+]
+if MCP_SERVER_FALLBACK_PACKAGE not in MCP_SERVER_PACKAGES:
+    MCP_SERVER_PACKAGES.append(MCP_SERVER_FALLBACK_PACKAGE)
+MCP_BROWSER_HEADLESS = False     # 必须为 False（用户需要看到浏览器）
+MCP_INITIALIZE_TIMEOUT = 60      # 首次启动可能需下载 npm 包，预留 60s
+MCP_DEFAULT_TIMEOUT = 30         # 常规工具调用超时
+MCP_SCREENSHOT_WIDTH = 1920      # 截图宽度
+MCP_SCREENSHOT_HEIGHT = 1080     # 截图高度
+
 # 可选模型列表
 MODEL_OPTIONS = {
     "mini (轻量)":  "doubao-seed-2-0-mini-260428",

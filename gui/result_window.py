@@ -41,6 +41,7 @@ class ResultWindow(QWidget):
     follow_up_requested = pyqtSignal(str)
     model_changed = pyqtSignal(str)
     settings_requested = pyqtSignal()
+    mode_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -103,6 +104,32 @@ class ResultWindow(QWidget):
 
     def refresh_sidebar(self, convs: list, active_id: str):
         self._sidebar_widget.set_conversations(convs, active_id)
+
+    def get_mode(self) -> str:
+        """当前输入模式：operate / chat。"""
+        if hasattr(self, "_mode_combo"):
+            return self._mode_combo.currentData()
+        return "operate"
+
+    def set_mode(self, mode: str):
+        """设置输入模式。"""
+        if not hasattr(self, "_mode_combo"):
+            return
+        target = "chat" if mode == "chat" else "operate"
+        for i in range(self._mode_combo.count()):
+            if self._mode_combo.itemData(i) == target:
+                self._mode_combo.setCurrentIndex(i)
+                return
+
+    def _on_mode_changed(self):
+        mode = self.get_mode()
+        if mode == "chat":
+            self._ask_input.setPlaceholderText("输入问题，Enter 发送...")
+            self._title_label.setText("Ai_Flow · 问答")
+        else:
+            self._ask_input.setPlaceholderText("输入要操作的任务，Enter 执行...")
+            self._title_label.setText("Ai_Flow · 操作")
+        self.mode_changed.emit(mode)
 
     # ============================================================
     # UI Setup
@@ -332,8 +359,29 @@ class ResultWindow(QWidget):
         ask_layout = QHBoxLayout()
         ask_layout.setSpacing(6)
 
+        self._mode_combo = QComboBox()
+        self._mode_combo.setFixedWidth(76)
+        self._mode_combo.addItem("操作", "operate")
+        self._mode_combo.addItem("问答", "chat")
+        self._mode_combo.setCurrentIndex(0)
+        self._mode_combo.setToolTip("切换输入模式")
+        self._mode_combo.setStyleSheet("""
+            QComboBox {
+                background: #26384a; color: #d7ecff; border: 1px solid #4d708f;
+                border-radius: 5px; padding: 4px 7px; font-size: 11px;
+            }
+            QComboBox:hover { border-color: #6fa1ca; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background: #2a2a35; color: #ddd; selection-background-color: #315c7c;
+                border: 1px solid #555;
+            }
+        """)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        ask_layout.addWidget(self._mode_combo)
+
         self._ask_input = QLineEdit()
-        self._ask_input.setPlaceholderText("💬 输入追问内容，Enter 发送...")
+        self._ask_input.setPlaceholderText("输入要操作的任务，Enter 执行...")
         self._ask_input.setFont(QFont("Microsoft YaHei", 11))
         self._ask_input.setStyleSheet("""
             QLineEdit {
@@ -503,10 +551,15 @@ class ResultWindow(QWidget):
         cursor = self._text_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self._text_view.setTextCursor(cursor)
+        self._text_view.ensureCursorVisible()
 
     def set_content(self, text: str):
         self._buffer = text
         self._text_view.setHtml(self._render_markdown(text))
+        cursor = self._text_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._text_view.setTextCursor(cursor)
+        self._text_view.ensureCursorVisible()
 
     def clear_content(self):
         self._buffer = ""

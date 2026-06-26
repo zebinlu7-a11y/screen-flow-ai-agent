@@ -7,6 +7,7 @@ LangGraph 核心状态机 + 流式接口。
   - 保留最近 N 轮对话上下文
   - 直接调用 ChatDoubaoVL.stream() 获取逐 token 输出
 """
+import re
 from typing import AsyncIterator, Optional, List
 
 from langgraph.graph import StateGraph, END

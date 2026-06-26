@@ -42,7 +42,7 @@ HIDDEN_IMPORTS = [
     'langchain_core.language_models',
     'langchain_core.language_models.chat_models',
     'langchain_core.callbacks', 'langchain_core.outputs',
-    'volcenginesdkarkruntime',
+    'openai',
     'json', 're', 'io', 'base64',
 ]
 

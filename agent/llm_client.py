@@ -1,52 +1,39 @@
 """
-豆包 VL 自定义 LangChain ChatModel — 封装火山引擎方舟 Ark SDK (responses API)。
+Doubao VL LangChain ChatModel wrapper using the OpenAI-compatible API.
 
-该模块创建了一个自定义的 BaseChatModel 子类 ChatDoubaoVL，
-使豆包 VL 的 responses.create API 可以无缝集成到 LangGraph 的流式管道中。
-
-消息格式转换：
-  LangChain (OpenAI-style)  →  Ark (responses-style)
-  ─────────────────────────────────────────────────
-  {"type": "text", ...}      →  {"type": "input_text", "text": ...}
-  {"type": "image_url", ...} →  {"type": "input_image", "image_url": ...}
+Volcano Ark exposes an OpenAI-compatible chat completions endpoint, so this
+module uses openai.OpenAI instead of the Ark runtime SDK. The public class name
+is kept as ChatDoubaoVL to avoid changing the rest of the project.
 """
-import base64
-from typing import Any, Iterator, List, Mapping, Optional, Sequence, Union
+from typing import Any, Iterator, List, Mapping, Optional, Union
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.language_models.chat_models import BaseChatModel, generate_from_stream
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
     AIMessage,
     AIMessageChunk,
-    SystemMessage,
+    BaseMessage,
     ChatMessage,
+    HumanMessage,
+    SystemMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from pydantic import Field, PrivateAttr
-
-from volcenginesdkarkruntime import Ark
+from openai import OpenAI
+try:
+    from langchain_core.pydantic_v1 import Field, PrivateAttr
+except ImportError:
+    from pydantic.v1 import Field, PrivateAttr
 
 from config import ARK_API_KEY, ARK_BASE_URL, DOUBAO_MODEL_NAME
 
 
 class ChatDoubaoVL(BaseChatModel):
     """
-    豆包 VL 多模态大模型 LangChain 封装。
+    Doubao multimodal chat model wrapper.
 
-    使用火山引擎方舟 Ark SDK 的 responses.create API，
-    支持文本 + 图片多模态输入和流式输出。
-
-    用法:
-        llm = ChatDoubaoVL()
-        messages = [HumanMessage(content=[
-            {"type": "text", "text": "这是什么?"},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
-        ])]
-        response = llm.invoke(messages)          # 非流式
-        async for chunk in llm.astream(messages): # 流式
-            print(chunk.content)
+    Input/output follow the OpenAI chat completions format:
+    - text blocks: {"type": "text", "text": "..."}
+    - image blocks: {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
     """
 
     model_name: str = Field(default="")
@@ -54,48 +41,45 @@ class ChatDoubaoVL(BaseChatModel):
     base_url: str = Field(default=ARK_BASE_URL)
     temperature: float = Field(default=0.7)
 
-    _client: Ark = PrivateAttr()
+    _client: OpenAI = PrivateAttr()
 
     def __init__(self, **kwargs):
-        # 动态读取 API Key（支持运行时修改）
-        from config import ARK_API_KEY, DOUBAO_MODEL_NAME
+        # Read the API key at construction time so settings changed in the UI
+        # are picked up by newly-created model instances.
+        from config import ARK_API_KEY
+
         if "api_key" not in kwargs:
             kwargs["api_key"] = ARK_API_KEY
-        if "model_name" not in kwargs:
-            kwargs["model_name"] = DOUBAO_MODEL_NAME
         super().__init__(**kwargs)
         self._create_client()
 
     def _create_client(self):
-        """（重新）创建 Ark 客户端。API Key 变更后可调用。"""
-        self._client = Ark(
+        """Create or recreate the OpenAI-compatible client."""
+        self._client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
         )
 
     def reload_api_key(self, new_key: str):
-        """更新 API Key 并重建客户端。"""
+        """Update API key and rebuild the client."""
         self.api_key = new_key
         self._create_client()
 
-    # ============================================================
-    # LangChain 要求的属性
-    # ============================================================
-
     @property
     def _llm_type(self) -> str:
-        return "doubao-vl"
+        return "doubao-vl-openai-compatible"
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
         return {
-            "model_name": self.model_name,
+            "model_name": self.model_name or DOUBAO_MODEL_NAME,
             "base_url": self.base_url,
         }
 
-    # ============================================================
-    # 非流式生成
-    # ============================================================
+    def _active_model(self) -> str:
+        from config import DOUBAO_MODEL_NAME
+
+        return self.model_name or DOUBAO_MODEL_NAME
 
     def _generate(
         self,
@@ -104,35 +88,19 @@ class ChatDoubaoVL(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs,
     ) -> ChatResult:
-        """非流式调用 Ark responses.create。"""
-        ark_input = self._convert_messages_to_ark(messages)
-
-        # 动态读取当前模型（支持运行时切换）
-        from config import DOUBAO_MODEL_NAME
-        response = self._client.responses.create(
-            model=DOUBAO_MODEL_NAME,
-            input=ark_input,
+        """Non-streaming OpenAI-compatible chat completions call."""
+        response = self._client.chat.completions.create(
+            model=self._active_model(),
+            messages=self._convert_messages_to_openai(messages),
             temperature=self.temperature,
+            stop=stop,
         )
 
-        # 从 Response 对象中提取输出文本（跳过 reasoning 等无 content 的 item）
         text = ""
-        if hasattr(response, "output") and response.output:
-            for item in response.output:
-                # 跳过 ResponseReasoningItem 等无 content 属性的 item
-                if not hasattr(item, "content") or not item.content:
-                    continue
-                for part in item.content:
-                    if hasattr(part, "text") and part.text:
-                        text += part.text
+        if response.choices:
+            text = response.choices[0].message.content or ""
 
-        message = AIMessage(content=text)
-        generation = ChatGeneration(message=message)
-        return ChatResult(generations=[generation])
-
-    # ============================================================
-    # 流式生成
-    # ============================================================
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
 
     def _stream(
         self,
@@ -141,136 +109,90 @@ class ChatDoubaoVL(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs,
     ) -> Iterator[ChatGenerationChunk]:
-        """流式调用 Ark responses.create(stream=True)。"""
-        ark_input = self._convert_messages_to_ark(messages)
-
-        # 动态读取当前模型（支持运行时切换）
-        from config import DOUBAO_MODEL_NAME
-        stream = self._client.responses.create(
-            model=DOUBAO_MODEL_NAME,
-            input=ark_input,
+        """Streaming OpenAI-compatible chat completions call."""
+        stream = self._client.chat.completions.create(
+            model=self._active_model(),
+            messages=self._convert_messages_to_openai(messages),
             temperature=self.temperature,
+            stop=stop,
             stream=True,
         )
 
         for event in stream:
-            # response.output_text.delta — 逐 token 文本输出
-            if hasattr(event, "type") and event.type == "response.output_text.delta":
-                delta = getattr(event, "delta", "")
-                if delta:
-                    chunk = ChatGenerationChunk(message=AIMessageChunk(content=delta))
-                    if run_manager:
-                        run_manager.on_llm_new_token(delta, chunk=chunk)
-                    yield chunk
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta.content or ""
+            if not delta:
+                continue
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content=delta))
+            if run_manager:
+                run_manager.on_llm_new_token(delta, chunk=chunk)
+            yield chunk
 
-    # ============================================================
-    # LangChain → Ark 消息格式转换
-    # ============================================================
-
-    def _convert_messages_to_ark(self, messages: List[BaseMessage]) -> List[dict]:
-        """
-        将 LangChain 消息列表转换为 Ark responses.create 的 input 格式。
-
-        LangChain 多模态格式 (OpenAI-style):
-            HumanMessage(content=[
-                {"type": "text", "text": "你好"},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
-            ])
-
-        Ark responses 格式:
-            [{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "你好"},
-                    {"type": "input_image", "image_url": "data:image/jpeg;base64,...", "detail": "auto"},
-                ]
-            }]
-        """
-        ark_input = []
-
+    def _convert_messages_to_openai(self, messages: List[BaseMessage]) -> List[dict]:
+        openai_messages = []
         for msg in messages:
-            role = self._get_ark_role(msg)
-            content = self._convert_content_to_ark(msg.content)
-            if content is not None:
-                ark_input.append({"role": role, "content": content})
+            content = self._convert_content_to_openai(msg.content)
+            if content is None:
+                continue
+            openai_messages.append({
+                "role": self._get_openai_role(msg),
+                "content": content,
+            })
+        return openai_messages
 
-        return ark_input
-
-    def _get_ark_role(self, message: BaseMessage) -> str:
-        """将 LangChain 消息类型映射为 Ark role。"""
+    def _get_openai_role(self, message: BaseMessage) -> str:
         if isinstance(message, HumanMessage):
             return "user"
-        elif isinstance(message, AIMessage):
+        if isinstance(message, AIMessage):
             return "assistant"
-        elif isinstance(message, SystemMessage):
+        if isinstance(message, SystemMessage):
             return "system"
-        elif isinstance(message, ChatMessage):
+        if isinstance(message, ChatMessage):
             return message.role
         return "user"
 
-    def _convert_content_to_ark(
+    def _convert_content_to_openai(
         self, content: Union[str, List[dict]]
     ) -> Optional[Union[str, List[dict]]]:
-        """
-        将 LangChain 消息内容转换为 Ark 内容格式。
-
-        str → 保持为 str (Ark 也支持纯文本字符串内容)
-        list → 逐个 block 转换:
-            "text"       → "input_text"
-            "image_url"  → "input_image"
-        """
         if isinstance(content, str):
             return content
 
         if not isinstance(content, list):
             return str(content)
 
-        ark_content = []
+        openai_content = []
         for block in content:
             if not isinstance(block, dict):
                 continue
 
             block_type = block.get("type", "")
-
             if block_type == "text":
-                ark_content.append({
-                    "type": "input_text",
+                openai_content.append({
+                    "type": "text",
                     "text": block.get("text", ""),
                 })
-
             elif block_type == "image_url":
                 image_url_data = block.get("image_url", {})
-                url = ""
                 if isinstance(image_url_data, dict):
                     url = image_url_data.get("url", "")
-                elif isinstance(image_url_data, str):
-                    url = image_url_data
+                else:
+                    url = str(image_url_data or "")
+                if url:
+                    openai_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    })
 
-                ark_content.append({
-                    "type": "input_image",
-                    "image_url": url,
-                    "detail": "auto",
-                })
+        return openai_content or None
 
-            # 忽略不认识的 block type
-
-        if not ark_content:
-            return None
-
-        return ark_content
-
-
-# ============================================================
-# 便捷工厂函数
-# ============================================================
 
 def create_llm(streaming: bool = False) -> ChatDoubaoVL:
     """
-    创建 ChatDoubaoVL 实例。
+    Create a ChatDoubaoVL instance.
 
-    注意: ChatDoubaoVL 不通过 streaming 参数区分模式。
-    非流式使用 llm.invoke()，流式使用 llm.stream() / llm.astream()。
-    streaming 参数仅用于向后兼容，实际创建的是同一对象。
+    The streaming argument is kept for backwards compatibility. Use invoke()
+    for non-streaming and stream()/astream() for streaming.
     """
     return ChatDoubaoVL()
 
@@ -278,15 +200,7 @@ def create_llm(streaming: bool = False) -> ChatDoubaoVL:
 def build_multimodal_message(text: str, image_base64: str = "",
                              image_base64_list: Optional[List[str]] = None) -> HumanMessage:
     """
-    构建包含文本和多张图片的多模态 HumanMessage（LangChain 格式）。
-
-    Args:
-        text: 用户输入的文本提示词（可为空字符串）。
-        image_base64: 单张图片 Base64（向后兼容，优先用 image_base64_list）。
-        image_base64_list: 多张图片 Base64 列表。
-
-    Returns:
-        包含多模态内容列表的 HumanMessage。
+    Build a multimodal HumanMessage containing text and one or more JPEG images.
     """
     content: List[dict] = []
 
@@ -296,7 +210,6 @@ def build_multimodal_message(text: str, image_base64: str = "",
             "text": text.strip(),
         })
 
-    # 收集所有图片：优先用列表
     images = image_base64_list or []
     if not images and image_base64:
         images = [image_base64]
@@ -320,5 +233,5 @@ def build_multimodal_message(text: str, image_base64: str = "",
 
 
 def build_text_message(text: str) -> HumanMessage:
-    """构建纯文本的 HumanMessage（无图片）。"""
+    """Build a plain text HumanMessage."""
     return HumanMessage(content=text.strip())

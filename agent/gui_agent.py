@@ -1,10 +1,11 @@
 """
-GUI Agent RPA — 浏览器 MCP (Playwright CDP) + 视觉识别双引擎。
+GUI Agent RPA — Playwright MCP Server + ReAct 纯视觉引擎。
 
-参考 AI_RPA_pyqt.py 架构：
-  1. 读码识别：通过 Playwright CDP 注入 JS 扫描 DOM，返回元素 ai_id
-  2. 视觉识别：截图后用豆包 Vision 模型定位坐标
-  3. 三层执行：JS events → pyautogui → 豆包视觉回退
+架构（对齐 AI_RPA_pyqt.py）:
+  1. ReAct Agent：截图 → 模型观察思考 → 决定下一步 (click/type/press/scroll/wait)
+  2. 纯视觉定位：模型直接返回归一化坐标(0-1000)，转换为屏幕绝对坐标
+  3. pyautogui 执行
+  4. 循环直到模型判定任务完成或达到最大步数
 """
 import os
 import re
@@ -12,39 +13,442 @@ import json
 import time
 import base64
 import io
+import socket
+import shutil
 import threading
-from typing import List, Optional, Dict, Callable
-from dataclasses import dataclass, field
+import tempfile
+import subprocess
+from typing import List, Optional, Callable
 
 from PIL import Image
 
+from config import (
+    MCP_SERVER_PACKAGES,
+    MCP_INITIALIZE_TIMEOUT,
+    MCP_SCREENSHOT_WIDTH,
+    MCP_SCREENSHOT_HEIGHT,
+)
+
 
 # ============================================================
-# Browser MCP Engine (Playwright CDP)
+# MCP Exceptions
+# ============================================================
+
+class MCPError(Exception):
+    """Base MCP protocol error."""
+    def __init__(self, code: int, message: str, data=None):
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(f"MCP Error {code}: {message}")
+
+class MCPToolError(MCPError):
+    """Tool execution returned isError=true."""
+    def __init__(self, tool_name: str, result: dict):
+        self.tool_name = tool_name
+        super().__init__(-32000, f"Tool '{tool_name}' failed", result)
+
+class MCPTimeoutError(MCPError):
+    """Request timeout."""
+    def __init__(self, method: str, timeout: float):
+        super().__init__(-1, f"Request '{method}' timed out after {timeout}s")
+
+class MCPConnectionError(MCPError):
+    """Server connection lost (process died, pipe broken)."""
+    def __init__(self, reason: str):
+        super().__init__(-2, f"MCP server connection lost: {reason}")
+
+class MCPServerNotFound(MCPError):
+    """npx / Node.js not available."""
+    def __init__(self):
+        super().__init__(-3, "npx not found in PATH. Install Node.js to use Playwright MCP server.")
+
+
+# ============================================================
+# Shared JS Snippets (used by both MCP and CDP paths)
+# ============================================================
+
+_SCAN_DOM_JS = r"""
+() => {
+    window._ai_elements = [];
+    const elements = [];
+    let i = 0;
+    const pageInfo = {
+        title: document.title,
+        url: window.location.href,
+        viewport: { width: window.innerWidth, height: window.innerHeight }
+    };
+
+    function collect(root, depth) {
+        const selectors = 'input, button, textarea, a, [role="button"], .el-button, .el-input__inner, span, div, li, h1, h2, h3, h4, h5, h6, p, label, form, select, option, img, iframe, section, article, nav, header, footer';
+        const nodes = root.querySelectorAll(selectors);
+        nodes.forEach(el => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 1 && rect.height > 1 && rect.top < window.innerHeight + 1000) {
+                const rawText = [el.innerText, el.value, el.placeholder, el.title, el.getAttribute('name'), el.getAttribute('aria-label'), el.getAttribute('alt')].filter(Boolean).join(' ').trim().substring(0, 150);
+                let parentText = "";
+                if (el.parentElement) {
+                    parentText = (el.parentElement.innerText || "").trim().substring(0, 80);
+                }
+                elements.push({
+                    tag: el.tagName,
+                    text: rawText,
+                    value: el.value || "",
+                    placeholder: el.placeholder || "",
+                    title: el.title || "",
+                    id: el.id || "",
+                    name: el.getAttribute('name') || "",
+                    ariaLabel: el.getAttribute('aria-label') || "",
+                    className: (el.className || "").substring(0, 80),
+                    href: el.href || "",
+                    src: el.src || "",
+                    type: el.type || el.getAttribute('type') || "",
+                    role: el.getAttribute('role') || "",
+                    pos: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+                    depth: depth,
+                    parentText: parentText,
+                    ai_id: i
+                });
+                window._ai_elements.push(el);
+                i++;
+            }
+        });
+
+        // Shadow DOM
+        root.querySelectorAll('*').forEach(node => {
+            if (node.shadowRoot) {
+                collect(node.shadowRoot, depth + 1);
+            }
+        });
+
+        // iframe
+        root.querySelectorAll('iframe').forEach(iframe => {
+            try {
+                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                if (iframeDoc) {
+                    const rect = iframe.getBoundingClientRect();
+                    elements.push({
+                        tag: 'IFRAME',
+                        text: 'IFRAME: ' + (iframe.src || 'unknown'),
+                        src: iframe.src || "",
+                        pos: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+                        depth: depth,
+                        parentText: "",
+                        ai_id: i
+                    });
+                    window._ai_elements.push(iframe);
+                    i++;
+                    collect(iframeDoc, depth + 1);
+                }
+            } catch(e) {}
+        });
+    }
+
+    collect(document, 0);
+    return JSON.stringify({ pageInfo: pageInfo, elements: elements });
+}
+"""
+
+
+def _build_execute_js(ai_id: int, action: str, value: str = "") -> str:
+    """Build JS for element operation."""
+    return r"""(function() {
+    const el = window._ai_elements[""" + str(ai_id) + r"""];
+    if (!el) return "ELEMENT_LOST";
+    el.scrollIntoView({block: 'center', behavior: 'instant'});
+
+    if ("__ACTION__" === "click") {
+        const opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+        el.dispatchEvent(new PointerEvent('pointerdown', opts));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.focus();
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new PointerEvent('pointerup', opts));
+        el.click();
+        return "OK";
+    }
+    else if ("__ACTION__" === "fill") {
+        el.focus();
+        el.value = __VALUE__;
+        ['input', 'change', 'blur'].forEach(function(ev) {
+            el.dispatchEvent(new Event(ev, { bubbles: true }));
+        });
+        return "OK";
+    }
+    else if ("__ACTION__" === "move") {
+        const r = el.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width/2, y: r.top + r.height/2 });
+    }
+    return "OK";
+})()""".replace("__ACTION__", action).replace("__VALUE__", json.dumps(str(value)))
+
+
+# ============================================================
+# Playwright MCP Client (JSON-RPC 2.0 over stdio)
+# ============================================================
+
+class PlaywrightMCPClient:
+    """JSON-RPC 2.0 communication with Playwright MCP Server."""
+
+    def __init__(self, headless: bool = False):
+        self._process = None
+        self._request_id = 0
+        self._pending = {}
+        self._responses = {}
+        self._lock = threading.Lock()
+        self._reader_thread = None
+        self._stderr_thread = None
+        self._running = False
+        self._headless = headless
+        self._tools = {}
+        self._tool_prefix = "browser"
+        self._npx = shutil.which("npx")
+        if not self._npx:
+            self._npx = shutil.which("npx.cmd")
+
+    def _start_server(self) -> bool:
+        if not self._npx:
+            raise MCPServerNotFound()
+        last_error = None
+        for package in MCP_SERVER_PACKAGES:
+            cmd = [self._npx, "-y", package]
+            print(f"[MCP-Client] 启动: {' '.join(cmd)}")
+            try:
+                self._process = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                    bufsize=1, env={**os.environ},
+                )
+            except FileNotFoundError:
+                raise MCPServerNotFound()
+            except Exception as e:
+                last_error = e
+                continue
+            self._running = True
+            self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader_thread.start()
+            self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+            self._stderr_thread.start()
+            return True
+        raise MCPConnectionError(f"Failed to start MCP server: {last_error}")
+
+    def _read_loop(self):
+        while self._running:
+            try:
+                line = self._process.stdout.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_id = msg.get("id")
+            if msg_id is not None:
+                with self._lock:
+                    self._responses[msg_id] = msg
+                    event = self._pending.pop(msg_id, None)
+                if event:
+                    event.set()
+
+    def _stderr_loop(self):
+        while self._running:
+            try:
+                line = self._process.stderr.readline()
+            except Exception:
+                break
+            if not line:
+                break
+
+    def _send_request(self, method: str, params: dict = None, timeout: float = 30.0) -> dict:
+        if not self._process or self._process.poll() is not None:
+            raise MCPConnectionError("Server process died")
+        with self._lock:
+            req_id = self._request_id
+            self._request_id += 1
+            event = threading.Event()
+            self._pending[req_id] = event
+        request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
+        try:
+            self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise MCPConnectionError(f"Broken pipe: {e}")
+        if not event.wait(timeout):
+            with self._lock:
+                self._pending.pop(req_id, None)
+            raise MCPTimeoutError(method, timeout)
+        with self._lock:
+            response = self._responses.pop(req_id, None)
+        if response is None:
+            raise MCPConnectionError("Response disappeared")
+        if "error" in response:
+            err = response["error"]
+            raise MCPError(err.get("code", -1), err.get("message", "Unknown"), err.get("data"))
+        return response.get("result", {})
+
+    def _send_notification(self, method: str, params: dict = None):
+        if not self._process or self._process.poll() is not None:
+            return
+        notification = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        try:
+            self._process.stdin.write(json.dumps(notification, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def initialize(self, timeout: float = 60.0) -> bool:
+        self._start_server()
+        init_result = self._send_request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "AIRAG", "version": "1.0.0"},
+        }, timeout=timeout)
+        print(f"[MCP-Client] 已初始化: {init_result.get('serverInfo', {}).get('name', 'unknown')}")
+        self._send_notification("notifications/initialized", {})
+        tools_result = self._send_request("tools/list", {}, timeout=30)
+        for t in tools_result.get("tools", []):
+            self._tools[t["name"]] = t
+        self._tool_prefix = "browser" if any(name.startswith("browser_") for name in self._tools) else "playwright"
+        print(f"[MCP-Client] 可用工具: {list(self._tools.keys())}")
+        return True
+
+    def call_tool(self, name: str, arguments: dict = None, timeout: float = 30.0) -> dict:
+        mapped = name
+        if self._tool_prefix == "browser" and name.startswith("playwright_"):
+            mapped = "browser_" + name[len("playwright_"):]
+        elif self._tool_prefix == "playwright" and name.startswith("browser_"):
+            mapped = "playwright_" + name[len("browser_"):]
+        if mapped in self._tools:
+            name = mapped
+        result = self._send_request("tools/call", {
+            "name": name, "arguments": arguments or {},
+        }, timeout=timeout)
+        if result.get("isError"):
+            raise MCPToolError(name, result)
+        return result
+
+    def navigate(self, url: str) -> bool:
+        self.call_tool("browser_navigate", {"url": url}, timeout=30)
+        print(f"[MCP-Client] 已导航: {url}")
+        return True
+
+    def evaluate(self, script: str) -> str:
+        if self._tool_prefix == "playwright":
+            result = self.call_tool("playwright_evaluate", {"script": script}, timeout=15)
+        else:
+            result = self.call_tool("browser_run_code_unsafe", {
+                "code": f"async (page) => {{ return await page.evaluate({json.dumps(script)}); }}"
+            }, timeout=15)
+        content = result.get("content", [])
+        for item in content:
+            if item.get("type") == "text":
+                return item.get("text", "")
+        return str(content) if isinstance(content, str) else str(content)
+
+    def screenshot(self) -> Optional[Image.Image]:
+        if self._tool_prefix == "playwright":
+            result = self.call_tool("playwright_screenshot", {
+                "name": "screenshot",
+                "width": MCP_SCREENSHOT_WIDTH,
+                "height": MCP_SCREENSHOT_HEIGHT,
+            }, timeout=15)
+        else:
+            result = self.call_tool("browser_take_screenshot", {
+                "type": "png", "fullPage": False, "filename": "airag-page.png",
+            }, timeout=15)
+        content = result.get("content", [])
+        for item in content:
+            if item.get("type") == "image":
+                b64_data = item.get("data", "")
+                if b64_data:
+                    return Image.open(io.BytesIO(base64.b64decode(b64_data)))
+            elif item.get("type") == "text":
+                text = item.get("text", "")
+                if text.startswith("data:image/"):
+                    b64_data = text.split(",", 1)[-1]
+                    return Image.open(io.BytesIO(base64.b64decode(b64_data)))
+        return None
+
+    def close_browser(self):
+        try:
+            self.call_tool("browser_close", {}, timeout=5)
+        except Exception:
+            pass
+
+    def shutdown(self):
+        self._running = False
+        self.close_browser()
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2)
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=2)
+        self._process = None
+        self._tools.clear()
+        print("[MCP-Client] 已关闭")
+
+    def is_alive(self) -> bool:
+        return (self._process is not None and self._process.poll() is None and self._running)
+
+
+# ============================================================
+# Browser MCP Engine
 # ============================================================
 
 class BrowserMCP:
-    """Playwright 连接 Edge/Chrome CDP 进行 DOM 操作。"""
+    """Browser automation engine. Prioritizes MCP Server, falls back to CDP."""
 
-    def __init__(self):
+    def __init__(self, use_mcp_server: bool = True):
         self._playwright = None
         self._browser = None
         self._context = None
         self._page = None
         self._connected = False
+        self._launched_process = None
+        self._mcp_client = None
+        self._use_mcp_server = use_mcp_server
+        self._mcp_available = False
+
+    # ----- CDP fallback -----
 
     @staticmethod
-    def launch_browser(port: int = 9222) -> bool:
-        """自动找到 Edge/Chrome 并带 CDP 端口启动。先关闭已有进程确保 CDP 生效。"""
-        import subprocess
-        # 先关闭所有 Edge 进程
+    def _is_port_open(host: str = "127.0.0.1", port: int = 9222, timeout: float = 0.4) -> bool:
         try:
-            subprocess.run(["taskkill", "/f", "/im", "msedge.exe"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)
-        except Exception:
-            pass
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
+    @classmethod
+    def _wait_for_port(cls, host: str = "127.0.0.1", port: int = 9222, seconds: float = 8.0) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if cls._is_port_open(host, port):
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _launch_cdp_browser(self, port: int = 9222) -> bool:
         paths = [
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -54,50 +458,75 @@ class BrowserMCP:
         for p in paths:
             if os.path.exists(p):
                 try:
-                    subprocess.Popen([p, f"--remote-debugging-port={port}",
-                                      "--new-window", "--start-maximized", "about:blank"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print(f"[MCP] 已启动浏览器: {p}")
-                    time.sleep(3)
-                    return True
+                    user_data_dir = os.path.join(tempfile.gettempdir(), f"airag-cdp-profile-{port}")
+                    args = [p, f"--remote-debugging-port={port}",
+                            f"--user-data-dir={user_data_dir}",
+                            "--no-first-run", "--no-default-browser-check",
+                            "--new-window", "--start-maximized", "about:blank"]
+                    self._launched_process = subprocess.Popen(
+                        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"[MCP-CDP] 已启动浏览器: {p}")
+                    return self._wait_for_port(port=port)
                 except Exception as e:
-                    print(f"[MCP] 启动失败: {e}")
+                    print(f"[MCP-CDP] 启动失败: {e}")
         return False
 
-    def connect(self, cdp_url: str = "http://127.0.0.1:9222", auto_launch: bool = True) -> bool:
-        """连接到浏览器 CDP 端口。在当前线程内同步执行（参照 AI_RPA_pyqt.py）。"""
+    def _connect_cdp_fallback(self, cdp_url: str = "http://127.0.0.1:9222", auto_launch: bool = True) -> bool:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            print("[MCP] Playwright 未安装")
+            print("[MCP-CDP] Playwright 未安装")
             return False
-
         try:
-            self._playwright = sync_playwright().start()
+            if not self._playwright:
+                self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
-            self._context = self._browser.contexts[0]
-            self._page = self._context.pages[0] if self._context.pages else None
+            self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
+            self._page = self._context.pages[-1] if self._context.pages else self._context.new_page()
             self._connected = bool(self._page)
             if self._connected:
-                print(f"[MCP] ✅ 已连接: {self._page.title()}")
-                # 最大化以确保窗口可见并可截图
+                print(f"[MCP-CDP] 已连接: {self._page.title()}")
                 try:
-                    self._page.evaluate("() => { moveTo(0,0); resizeTo(screen.width, screen.height); }")
-                    import pyautogui
-                    pyautogui.hotkey("win", "up")
-                    time.sleep(0.5)
+                    self._page.evaluate("() => { if (!document.fullscreenElement) { moveTo(0,0); if (screen.width && screen.height && (window.outerWidth < screen.width*0.8 || window.outerHeight < screen.height*0.8)) { resizeTo(screen.width, screen.height); } } }")
                 except Exception:
                     pass
             return self._connected
         except Exception as e:
             err = str(e)
             if ("ECONNREFUSED" in err or "connect" in err.lower()) and auto_launch:
-                if self.launch_browser():
-                    print("[MCP] 浏览器已启动，重试连接...")
-                    time.sleep(3)
-                    return self.connect(cdp_url, auto_launch=False)
-            print(f"[MCP] 连接失败: {err}")
+                if self._launch_cdp_browser():
+                    print("[MCP-CDP] 浏览器已启动，重试连接...")
+                    return self._connect_cdp_fallback(cdp_url, auto_launch=False)
+            print(f"[MCP-CDP] 连接失败: {err}")
+            self.close()
             return False
+
+    # ----- MCP connection -----
+
+    def _connect_via_mcp(self) -> bool:
+        try:
+            self._mcp_client = PlaywrightMCPClient(headless=False)
+            self._mcp_client.initialize()
+            self._mcp_available = True
+            self._connected = True
+            print(f"[MCP] 已通过 MCP Server 连接")
+            return True
+        except MCPServerNotFound as e:
+            print(f"[MCP] npx 不可用: {e}")
+            return False
+        except (MCPTimeoutError, MCPConnectionError, MCPError) as e:
+            print(f"[MCP] MCP Server 启动失败: {e}")
+            return False
+        except Exception as e:
+            print(f"[MCP] 初始化异常: {e}")
+            return False
+
+    def connect(self, cdp_url: str = "http://127.0.0.1:9222", auto_launch: bool = True) -> bool:
+        if self._use_mcp_server:
+            if self._connect_via_mcp():
+                return True
+            print("[MCP] MCP 不可用 -> 回退 CDP...")
+        return self._connect_cdp_fallback(cdp_url=cdp_url, auto_launch=auto_launch)
 
     @property
     def page(self):
@@ -107,139 +536,117 @@ class BrowserMCP:
     def connected(self) -> bool:
         return self._connected
 
-    def get_active_page(self):
-        """获取最后打开的页面。"""
-        if not self._context:
-            return None
-        pages = self._context.pages
-        if pages:
-            self._page = pages[-1]
-        return self._page
+    def navigate(self, url: str) -> bool:
+        if self._mcp_available and self._mcp_client:
+            return self._mcp_client.navigate(url)
+        elif self._page:
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return True
+        return False
 
-    def scan_dom(self) -> str:
-        """注入 JS 扫描 DOM，返回 JSON 字符串 {pageInfo, elements}。"""
-        if not self._page:
-            return "{}"
-        self.get_active_page()
-        script = """
-        () => {
-            window._ai_elements = [];
-            const elements = [];
-            let i = 0;
-            const pageInfo = {
-                title: document.title,
-                url: window.location.href,
-                viewport: { width: window.innerWidth, height: window.innerHeight }
-            };
-            const selectors = 'input, button, textarea, a, [role="button"], .el-button, .el-input__inner, span, div, li, h1, h2, h3, h4, h5, h6, p, label, form, select, option, img, section, article, nav, header, footer';
-            const nodes = document.querySelectorAll(selectors);
-            nodes.forEach(el => {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 1 && rect.height > 1 && rect.top < window.innerHeight + 1000) {
-                    const text = (el.innerText || el.value || el.placeholder || el.title || "").trim().substring(0, 100);
-                    elements.push({
-                        tag: el.tagName,
-                        text: text,
-                        value: el.value || "",
-                        placeholder: el.placeholder || "",
-                        title: el.title || "",
-                        id: el.id || "",
-                        className: (el.className || "").substring(0, 80),
-                        href: el.href || "",
-                        type: el.type || el.getAttribute('type') || "",
-                        role: el.getAttribute('role') || "",
-                        pos: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
-                        ai_id: i
-                    });
-                    window._ai_elements.push(el);
-                    i++;
-                }
-            });
-            return JSON.stringify({ pageInfo: pageInfo, elements: elements });
-        }
-        """
-        return self._page.evaluate(script)
-
-    def execute_js(self, ai_id: int, action: str, value: str = "") -> str:
-        """通过 JS 在页面上执行操作。返回 "OK" / "ELEMENT_LOST" / 坐标JSON。"""
-        js = f"""
-        (val) => {{
-            const el = window._ai_elements[{ai_id}];
-            if (!el) return "ELEMENT_LOST";
-            el.scrollIntoView({{block: 'center', behavior: 'instant'}});
-
-            if ("{action}" === "click") {{
-                const opts = {{ bubbles: true, cancelable: true, view: window, buttons: 1 }};
-                el.dispatchEvent(new PointerEvent('pointerdown', opts));
-                el.dispatchEvent(new MouseEvent('mousedown', opts));
-                el.focus();
-                el.dispatchEvent(new MouseEvent('mouseup', opts));
-                el.dispatchEvent(new PointerEvent('pointerup', opts));
-                el.click();
-                return "OK";
-            }}
-            else if ("{action}" === "fill") {{
-                el.focus();
-                el.value = val;
-                ['input', 'change', 'blur'].forEach(ev => {{
-                    el.dispatchEvent(new Event(ev, {{ bubbles: true }}));
-                }});
-                return "OK";
-            }}
-            else if ("{action}" === "move") {{
-                const r = el.getBoundingClientRect();
-                return JSON.stringify({{ x: r.left + r.width/2, y: r.top + r.height/2 }});
-            }}
-            return "OK";
-        }}
-        """
-        return self._page.evaluate(js, str(value))
-
-    def screenshot_page(self) -> Optional[Image.Image]:
-        """对当前页面截图，返回 PIL Image。"""
-        if not self._page:
-            return None
-        raw = self._page.screenshot()
-        return Image.open(io.BytesIO(raw))
+    def maximize(self):
+        js = "() => { moveTo(0,0); if (screen && screen.width) { resizeTo(screen.width, screen.height); } }"
+        if self._mcp_available and self._mcp_client:
+            try:
+                self._mcp_client.evaluate(js)
+            except Exception:
+                pass
+        elif self._page:
+            try:
+                self._page.evaluate(js)
+            except Exception:
+                pass
+        import pyautogui
+        try:
+            time.sleep(0.2)
+            pyautogui.hotkey("win", "up")
+            time.sleep(0.3)
+        except Exception:
+            pass
 
     def close(self):
+        if self._mcp_available and self._mcp_client:
+            try:
+                self._mcp_client.shutdown()
+            except Exception:
+                pass
+            self._mcp_client = None
+            self._mcp_available = False
         try:
             if self._playwright:
                 self._playwright.stop()
         except Exception:
             pass
+        if self._launched_process:
+            try:
+                self._launched_process.terminate()
+            except Exception:
+                pass
+        self._connected = False
 
 
 # ============================================================
-# Vision Engine (豆包 VL 截图定位)
+# ReAct Agent — 截图观察 -> 思考 -> 行动 -> 循环
 # ============================================================
 
-VISION_PROMPT = """分析截图，找到与用户指令相关的元素位置，返回精确坐标。
+REACT_PROMPT = """你是桌面自动化专家。看截图 → 思考 → 决定下一步动作，用 ReAct 模式逐步完成任务。
 
-用户指令: {task}
+【用户任务】: {task}
 
-返回 JSON:
-{{
-  "found": true,
-  "x": 500,
-  "y": 300,
-  "reason": "简短原因"
-}}"""
+【已执行的历史】:
+{history}
+
+请仔细观察当前截图，思考：
+1. 当前屏幕上看到了什么？
+2. 已执行的操作产生了什么效果？
+3. 任务是否已完成？
+4. 如果未完成，下一步应该做什么？
+
+返回 JSON（只输出JSON）:
+
+如果任务已完成:
+{{"done": true, "reason": "任务完成了，因为...(描述当前屏幕状态证明任务完成)"}}
+
+如果还需要继续操作:
+{{"done": false, "thought": "描述看到了什么和下一步逻辑", "action": "click", "x": 500, "y": 300, "text": ""}}
+
+action 类型:
+- "click": 点击元素 → 同时返回 x, y (归一化坐标 0-1000)
+- "type":  在已聚焦的输入框中打字 → 用 text 字段传文字，无需坐标
+- "press": 按键盘键 → 用 text 字段传键名 ("enter", "ctrl+w", "alt+f4", "tab" 等)
+- "scroll": 滚动 → text="up" 或 "down"
+- "wait":  等待加载 → text="2" 表示等2秒
+
+坐标规则（重要！）:
+- x: 归一化横坐标 0-1000 (0=最左, 1000=最右)
+- y: 归一化纵坐标 0-1000 (0=最上, 1000=最下)
+- 例: 屏幕右上角的X按钮 ≈ x=980, y=10
+- 例: 屏幕中央 ≈ x=500, y=500
+- 例: 左侧标签页 ≈ x≈150, y≈30
+
+如果页面还在加载或不确定下一步，先等待:
+{{"done": false, "action": "wait", "text": "2"}}"""
 
 
-def vision_locate(task: str, image: Image.Image,
-                  model: str = "doubao-seed-2-0-lite-260428") -> Optional[dict]:
-    """用豆包 VL 观察截图，返回元素坐标。"""
+def react_decide(task: str, image: Image.Image, history: List[str],
+                 model: str = "doubao-seed-2-0-lite-260428") -> dict:
+    """ReAct 决策：截图 + 任务 + 历史 → {done, thought, action, x, y, text}。
+
+    纯视觉方法 — 模型观察截图，自己思考下一步该做什么、点哪里。
+    """
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
-    # PIL → base64 JPEG
+    img_w, img_h = image.size
     buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="JPEG", quality=80)
+    image.convert("RGB").save(buf, format="JPEG", quality=90)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
+    history_text = "\n".join(history[-10:]) if history else "(无 — 这是第一步)"
+    prompt_text = REACT_PROMPT.format(task=task, history=history_text)
+
     content = [
-        {"type": "text", "text": VISION_PROMPT.format(task=task)},
+        {"type": "text", "text": prompt_text},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
     ]
 
@@ -248,68 +655,7 @@ def vision_locate(task: str, image: Image.Image,
         response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
 
-        # 解析 JSON
-        m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
-        if m:
-            text = m.group(1)
-        else:
-            s = text.find("{")
-            e = text.rfind("}") + 1
-            if s >= 0 and e > s:
-                text = text[s:e]
-        return json.loads(text.replace("'", '"'))
-    except Exception as e:
-        print(f"[Vision] 识别失败: {e}")
-        return None
-
-
-# ============================================================
-# Analyzer — 任务分解
-# ============================================================
-
-ANALYZER_PROMPT = """你是桌面自动化专家。分析任务并分解为最小的操作步骤。
-
-重要原则:
-1. 如果任务涉及网页/浏览器，第一步必须是打开浏览器（Win+R→输入网址→回车）
-2. 每个步骤只能做一个动作
-3. 把复杂操作拆细（点击前先确保目标可见）
-
-可用动作: click(点击元素), fill(填写文字), press(按键盘键), scroll(滚动), wait(等待秒数)
-
-press 的常用键: enter, tab, escape, space, backspace, delete, win+r, ctrl+c, ctrl+v
-组合键放在 target 字段: 如 action="press" target="win+r"
-
-输出纯 JSON，step_id 从 1 开始:
-{{
-  "steps": [
-    {{"step_id":1, "desc":"打开运行窗口", "action":"press", "target":"win+r", "value":""}},
-    {{"step_id":2, "desc":"输入百度网址", "action":"fill", "target":"运行输入框", "value":"www.baidu.com"}},
-    {{"step_id":3, "desc":"确认打开", "action":"press", "target":"enter", "value":""}},
-    {{"step_id":4, "desc":"等待页面加载", "action":"wait", "target":"", "value":"5"}},
-    {{"step_id":5, "desc":"最大化浏览器窗口", "action":"press", "target":"win+up", "value":""}},
-    {{"step_id":6, "desc":"点击搜索框", "action":"click", "target":"搜索框", "value":""}},
-    {{"step_id":6, "desc":"输入搜索词", "action":"fill", "target":"搜索框", "value":"Python"}},
-    {{"step_id":7, "desc":"搜索", "action":"press", "target":"enter", "value":""}}
-  ]
-}}
-
-任务: {task}
-输出 JSON:"""
-
-
-def analyze_task(task: str) -> List[dict]:
-    """AI 分解任务为步骤列表。"""
-    from agent.llm_client import ChatDoubaoVL
-    from langchain_core.messages import HumanMessage
-
-    try:
-        print(f"[Analyzer] 正在分析: {task}")
-        llm = ChatDoubaoVL(model_name="doubao-seed-2-0-lite-260428")
-        response = llm.invoke([HumanMessage(content=ANALYZER_PROMPT.format(task=task))])
-        text = response.content if hasattr(response, 'content') else ""
-        print(f"[Analyzer] AI 原始输出:\n{text[:800]}")
-
-        # 提取 JSON
+        # Parse JSON
         m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
         if m:
             text = m.group(1)
@@ -317,142 +663,123 @@ def analyze_task(task: str) -> List[dict]:
             s, e = text.find("{"), text.rfind("}") + 1
             if s >= 0 and e > s:
                 text = text[s:e]
-        data = json.loads(text.replace("'", '"'))
-        steps = data.get("steps", [])
-        print(f"[Analyzer] 分解为 {len(steps)} 步:")
-        for s in steps:
-            print(f"  {s.get('step_id', s.get('id', '?'))}. [{s.get('action', '?')}] {s.get('desc', s.get('target', ''))}")
-        return steps
+        result = json.loads(text.replace("'", '"'))
+
+        # Normalize coordinates: 0-1000 → pixel
+        if not result.get("done") and "x" in result and "y" in result:
+            result["x_pixel"] = int(result["x"] * img_w / 1000)
+            result["y_pixel"] = int(result["y"] * img_h / 1000)
+
+        print(f"[ReAct] {json.dumps(result, ensure_ascii=False)[:400]}")
+        return result
     except Exception as e:
-        print(f"[Analyzer] 失败: {e}")
-        return [{"id": 1, "desc": task, "action": "click", "target": task, "value": ""}]
+        print(f"[ReAct] 决策失败: {e}")
+        return {"done": True, "reason": f"ReAct异常: {e}"}
 
 
 # ============================================================
-# Executor — 双引擎执行
+# Executor helpers
 # ============================================================
 
 def _screenshot_desktop() -> Image.Image:
-    """GUI Agent 专用：全桌面截图（pyautogui，稳定可靠）。"""
     import pyautogui
     return pyautogui.screenshot()
 
 
-def _pyautogui_execute(action: str, x: int, y: int, value: str = ""):
-    """用 pyautogui 执行桌面操作。"""
+def _pyautogui_click(x: int, y: int):
     import pyautogui
     pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.3
-
-    pyautogui.moveTo(x, y, duration=0.2)
-    if action == "click":
-        pyautogui.click()
-    elif action == "fill":
-        pyautogui.click()
-        time.sleep(0.3)
-        # 先全选再替换，确保输入干净
-        pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.1)
-        pyautogui.write(value, interval=0.05)
-    elif action == "press":
-        key = value or "enter"
-        try:
-            pyautogui.press(key)
-        except Exception:
-            pass
+    pyautogui.PAUSE = 0.2
+    pyautogui.moveTo(x, y, duration=0.15)
+    pyautogui.click()
 
 
-def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
-                 use_browser: bool = True,
-                 progress: Callable = None,
-                 hide_window: Callable = None,
-                 show_window: Callable = None) -> bool:
-    """
-    执行单个步骤。双引擎决策：
-    1. Playwright MCP (不影响鼠标，无干扰)
-    2. 视觉+pyautogui (先隐藏Ai_Flow窗口避免遮挡)
-    """
-    action = step.get("action", "click")
-    target = step.get("target", step.get("desc", ""))
-    value = step.get("value", "")
-    desc = step.get("desc", target)
-
-    if progress:
-        progress(f"▶ {desc}")
-
-    # 特殊动作
-    if action == "wait":
-        time.sleep(float(value or 1) if value else 1)
-        return True
-    if action == "press":
-        import pyautogui
-        key = value or target or "enter"
-        key_map = {"回车": "enter", "空格": "space", "tab": "tab", "esc": "escape"}
-        pyautogui.press(key_map.get(key, key))
-        return True
-
-    # ===== 引擎 1: Playwright MCP（优先，不影响鼠标）=====
-    if use_browser and mcp and mcp.connected:
-        try:
-            dom_json = mcp.scan_dom()
-            dom_data = json.loads(dom_json)
-            elements = dom_data.get("elements", [])
-
-            best, best_score = None, 0
-            for el in elements:
-                text = (el.get("text", "") + el.get("placeholder", "") +
-                        el.get("title", "") + el.get("id", "")).lower()
-                score = sum(1 for w in target.lower().split() if w in text)
-                if score > best_score:
-                    best_score, best = score, el
-
-            if best and best_score > 0:
-                ai_id = best["ai_id"]
-                result = mcp.execute_js(ai_id, action, value)
-                if result == "OK":
-                    print(f"[Exec] Playwright ✅: {desc} (ai_id={ai_id})")
-                    return True
-                print(f"[Exec] Playwright 失败 → 降级视觉...")
-        except Exception as e:
-            print(f"[Exec] Playwright 异常: {e}")
-
-    # ===== 引擎 2: 视觉 + pyautogui（隐藏 Ai_Flow 窗口避免遮挡）=====
-    if hide_window:
-        hide_window()
-        time.sleep(0.3)
-
+def _pyautogui_type(text: str):
+    import pyautogui
     try:
-        img = _screenshot_desktop()
-        if mcp and mcp.connected:
-            page_img = mcp.screenshot_page()
-            if page_img:
-                img = page_img
+        import pyperclip
+        pyperclip.copy(text)
+        pyautogui.hotkey("ctrl", "v")
+    except Exception:
+        pyautogui.write(text, interval=0.03)
 
-        pos = vision_locate(desc, img)
-        if show_window:
-            show_window()
 
-        if pos and pos.get("found"):
-            x, y = int(pos.get("x", 0)), int(pos.get("y", 0))
-            # 用真实屏幕分辨率做坐标映射（不写死 1920×1080）
-            import pyautogui
-            real_w, real_h = pyautogui.size()
-            img_w, img_h = img.size
-            if abs(img_w - real_w) > 10 or abs(img_h - real_h) > 10:
-                x = int(x * real_w / img_w)
-                y = int(y * real_h / img_h)
-            print(f"[Exec] 坐标: AI原始=({pos.get('x')},{pos.get('y')}) 图片={img_w}x{img_h} 屏幕={real_w}x{real_h} → 最终=({x},{y})")
-            _pyautogui_execute(action, x, y, value)
-            time.sleep(1.5)
-            print(f"[Exec] Vision ✅: {desc} ({x},{y})")
-            return True
-        print(f"[Exec] Vision 未找到: {desc}")
-    except Exception as e:
-        print(f"[Exec] Vision 异常: {e}")
-        if show_window:
-            show_window()
+def _pyautogui_press(key: str):
+    import pyautogui
+    key = key.strip().lower()
+    aliases = {"回车": "enter", "空格": "space", "esc": "escape"}
+    key = aliases.get(key, key)
+    if "+" in key:
+        keys = [aliases.get(k.strip(), k.strip()) for k in key.split("+")]
+        pyautogui.hotkey(*keys)
+    else:
+        pyautogui.press(key)
 
-    return False
+
+def _pyautogui_scroll(direction: str):
+    import pyautogui
+    amount = 3 if direction == "down" else -3
+    pyautogui.scroll(amount)
+
+
+# ============================================================
+# Browser task helpers
+# ============================================================
+
+def is_browser_task(task: str) -> bool:
+    text = (task or "").lower()
+    keywords = [
+        "浏览器", "网页", "网址", "网站", "http://", "https://", "www.",
+        "百度", "搜索", "google", "bing", "edge", "chrome", "打开网页",
+        "b站", "bilibili", "淘宝", "京东", "知乎", "微博",
+    ]
+    return any(k in text for k in keywords)
+
+
+def browser_bootstrap_steps(task: str) -> List[dict]:
+    """Determine URL and search query from task text."""
+    text = (task or "").strip()
+    lower = text.lower()
+    url = ""
+    search_query = ""
+
+    m = re.search(r"https?://[^\s，。]+|www\.[^\s，。]+", text, re.I)
+    if m:
+        url = m.group(0)
+        if url.startswith("www."):
+            url = "https://" + url
+
+    if not search_query:
+        for pat in [
+            r"搜索\s*(.+?)(?:然后|点击|进入|并|，|。|$)",
+            r"搜\s*(.+?)(?:然后|点击|进入|并|，|。|$)",
+            r"(?:search|find)\s+(.+?)(?:then|click|and|,|\.|$)",
+        ]:
+            m_query = re.search(pat, text, re.I)
+            if m_query:
+                search_query = m_query.group(1).strip(" ：:，。,. ")
+                break
+
+    if not url:
+        if "百度" in text or "baidu" in lower:
+            url = "https://www.baidu.com"
+        elif "google" in lower or "谷歌" in text:
+            url = "https://www.google.com"
+        elif "bing" in lower or "必应" in text:
+            url = "https://www.bing.com"
+        elif "bilibili" in lower or "b站" in text:
+            url = "https://www.bilibili.com"
+        else:
+            url = "https://www.baidu.com"
+
+    steps = [
+        {"action": "open_url", "url": url, "desc": f"打开 {url}"},
+        {"action": "wait", "seconds": 3, "desc": "等待页面加载"},
+        {"action": "maximize", "desc": "最大化浏览器窗口"},
+    ]
+    if search_query:
+        steps[0]["search_query"] = search_query
+    return steps
 
 
 # ============================================================
@@ -461,7 +788,7 @@ def execute_step(step: dict, mcp: Optional[BrowserMCP] = None,
 
 def audit_result(task: str, image: Image.Image,
                  model: str = "doubao-seed-2-0-pro-260215") -> dict:
-    """截图审计：对比用户任务与当前屏幕状态。"""
+    """Final audit: compare current screen with task goal."""
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
@@ -469,18 +796,17 @@ def audit_result(task: str, image: Image.Image,
     image.convert("RGB").save(buf, format="JPEG", quality=85)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    prompt = f"""你现在是一个验收员。请仔细查看当前屏幕截图，判断以下任务是否已完成。
+    prompt = f"""你是验收员。请查看当前屏幕截图，判断以下任务是否已完成。
 
 原始任务: {task}
 
-请逐项检查：
-1. 浏览器是否打开？能看到什么页面？
-2. 页面URL/标题是否与任务目标一致？
-3. 输入框内容是否正确？
-4. 整体状态是否符合预期？
+请检查：
+1. 当前屏幕显示了什么？
+2. 是否与任务目标一致？
+3. 如果未完成，缺少什么？
 
-返回 JSON (只输出JSON，不要其他):
-{{"success": true/false, "reason": "当前屏幕显示了什么，与任务的对比结论", "need_human": false/true}}"""
+返回 JSON (只输出JSON):
+{{"success": true/false, "reason": "当前屏幕状态与任务目标的对比", "need_human": false/true}}"""
 
     content = [
         {"type": "text", "text": prompt},
@@ -491,7 +817,8 @@ def audit_result(task: str, image: Image.Image,
         llm = ChatDoubaoVL(model_name=model)
         response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
-        print(f"[Auditor] AI输出: {text[:500]}" if len(text) > 300 else f"[Auditor] AI输出: {text}")
+        print(f"[Auditor] {text[:400]}")
+
         m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
         if m:
             text = m.group(1)
@@ -499,73 +826,187 @@ def audit_result(task: str, image: Image.Image,
             m = re.search(r'\{.*\}', text, re.DOTALL)
             if m:
                 text = m.group()
-        # 清理常见JSON问题
         text = text.strip()
-        # 修复尾逗号: "need_human": false,} → "need_human": false}
         text = re.sub(r',\s*}', '}', text)
         text = re.sub(r',\s*]', ']', text)
         return json.loads(text)
     except Exception as e:
-        print(f"[Auditor] 解析失败(raw): {text[:200]}")
+        print(f"[Auditor] 解析失败: {e}")
         return {"success": False, "reason": f"审计异常: {e}", "need_human": True}
 
 
 # ============================================================
-# Main Pipeline
+# Main Pipeline — ReAct Loop
 # ============================================================
 
+MAX_REACT_ITERATIONS = 15
+MAX_CONSECUTIVE_SAME_ACTION = 3
+
+
 def run_gui_task(task: str,
-                 use_browser: bool = True,  # 独立进程无 Qt 限制，默认启用 MCP
-                 steps: List[dict] = None,
+                 use_browser: bool = True,
+                 cancel_file: str = "",
                  progress_callback: Callable = None,
                  hide_window: Callable = None,
                  show_window: Callable = None) -> dict:
-    """完整 RPA 流水线。"""
+    """ReAct RPA pipeline.
+
+    1. If browser task: open URL + maximize (deterministic bootstrap)
+    2. ReAct loop: screenshot → AI thinks → act → repeat until done
+    3. Final audit
+    """
+    import pyautogui
+
+    browser_needed = use_browser and is_browser_task(task)
     mcp = None
-    if use_browser:
+    if browser_needed:
+        if progress_callback:
+            progress_callback("检测到浏览器任务，准备连接浏览器自动化...")
         mcp = BrowserMCP()
         mcp.connect()
-
-    # Phase 1: Analyze
-    if not steps:
         if progress_callback:
-            progress_callback("🔍 分析任务...")
-        steps = analyze_task(task)
+            progress_callback("正在打开浏览器页面...")
+        bootstrap = browser_bootstrap_steps(task)
+        for s in bootstrap:
+            if s["action"] == "open_url":
+                if mcp and mcp.connected:
+                    mcp.navigate(s["url"])
+                else:
+                    _pyautogui_press("win+r")
+                    time.sleep(0.8)
+                    try:
+                        import pyperclip
+                        pyperclip.copy(s["url"])
+                        pyautogui.hotkey("ctrl", "v")
+                    except Exception:
+                        pyautogui.write(s["url"], interval=0.02)
+                    time.sleep(0.3)
+                    _pyautogui_press("enter")
+                    time.sleep(3)
+                    pyautogui.hotkey("win", "up")
+                if progress_callback:
+                    progress_callback(f"  已打开: {s['url']}")
+            elif s["action"] == "wait":
+                time.sleep(s.get("seconds", 2))
+            elif s["action"] == "maximize":
+                if mcp and mcp.connected:
+                    mcp.maximize()
+                else:
+                    pyautogui.hotkey("win", "up")
+                    time.sleep(0.5)
+    elif progress_callback:
+        progress_callback("非浏览器任务，使用纯视觉/鼠标键盘操作...")
 
-    if not steps:
-        return {"success": False, "message": "任务分析失败"}
+    # --- ReAct Loop ---
+    history = []
+    last_action_key = ""
+    same_action_count = 0
+    start_time = time.time()
 
-    # Phase 2: Execute
-    ok = 0
-    total = len(steps)
-    for i, step in enumerate(steps):
-        action = step.get("action", "click")
-        desc = step.get("desc", step.get("target", ""))
+    for iteration in range(MAX_REACT_ITERATIONS):
+        # ESC cancel check
+        if cancel_file and os.path.exists(cancel_file):
+            print("[Cancelled] 检测到 ESC 取消信号")
+            if mcp:
+                mcp.close()
+            return {
+                "success": False, "canceled": True,
+                "message": "操作已被用户取消 (ESC)",
+                "steps_done": f"{len(history)}/{iteration}",
+                "need_human": False,
+            }
+
         if progress_callback:
-            progress_callback(f"[{i+1}/{total}] {desc}")
-        success = execute_step(step, mcp, use_browser, None,
-                               hide_window, show_window)
-        if success:
-            ok += 1
+            progress_callback(f"🔄 ReAct 第{iteration+1}步: 截图观察...")
+
+        # Hide AIRAG window for clean screenshot
+        if hide_window:
+            hide_window()
+            time.sleep(0.2)
+
+        img = _screenshot_desktop()
+
+        if show_window:
+            show_window()
+
+        # ReAct decision
+        decision = react_decide(task, img, history)
+
+        if decision.get("done"):
             if progress_callback:
-                progress_callback(f"  ✅ {desc}")
+                progress_callback(f"✅ ReAct 判定完成: {decision.get('reason', '')}")
+            break
+
+        # Execute action
+        action = decision.get("action", "click")
+        thought = decision.get("thought", "")
+        text = decision.get("text", "")
+        x = decision.get("x_pixel", 0)
+        y = decision.get("y_pixel", 0)
+
+        if progress_callback:
+            progress_callback(f"  💭 {thought[:100]}")
+            if action == "click":
+                progress_callback(f"  🖱️ {action} ({x},{y})")
+            elif action == "type":
+                progress_callback(f"  ⌨️ {action}: \"{text[:50]}\"")
+            elif action == "press":
+                progress_callback(f"  🔤 {action}: \"{text}\"")
+            else:
+                progress_callback(f"  ⏳ {action}: {text}")
+
+        try:
+            if action == "click":
+                _pyautogui_click(x, y)
+            elif action == "type":
+                _pyautogui_type(text)
+            elif action == "press":
+                _pyautogui_press(text)
+            elif action == "scroll":
+                _pyautogui_scroll(text or "down")
+            elif action == "wait":
+                time.sleep(min(float(text or 1), 5))
+            else:
+                print(f"[ReAct] 未知动作: {action}")
+        except Exception as e:
+            print(f"[ReAct] 执行失败: {e}")
+
+        # Record history
+        action_desc = f"{action}"
+        if action == "click":
+            action_desc += f" ({x},{y})"
+        elif action in ("type", "press", "scroll"):
+            action_desc += f" \"{text}\""
+        history.append(f"[{iteration+1}] {thought} → {action_desc}")
+        time.sleep(1.5)
+
+        # Detect stuck loops
+        action_key = f"{action}:{text}:{x}:{y}"
+        if action_key == last_action_key:
+            same_action_count += 1
+            if same_action_count >= MAX_CONSECUTIVE_SAME_ACTION:
+                print(f"[ReAct] 连续{MAX_CONSECUTIVE_SAME_ACTION}次相同动作，退出循环")
+                break
         else:
-            if progress_callback:
-                progress_callback(f"  ⚠️ {desc} (跳过)")
-        time.sleep(0.5)
+            same_action_count = 0
+            last_action_key = action_key
 
-    # 给操作留出生效时间
-    time.sleep(2)
+    elapsed = time.time() - start_time
 
-    # Phase 3: Audit
+    # --- Final Audit ---
     if progress_callback:
-        progress_callback("🔎 审计中...")
-    img = _screenshot_desktop()
-    if mcp and mcp.connected:
-        page_img = mcp.screenshot_page()
-        if page_img:
-            img = page_img
-    audit = audit_result(task, img)
+        progress_callback("🔎 最终审计中...")
+    try:
+        img = _screenshot_desktop()
+        if mcp and mcp.connected:
+            page_img = mcp.screenshot_page()
+            if page_img:
+                img = page_img
+        audit = audit_result(task, img)
+    except Exception as e:
+        audit = {"success": len(history) > 0,
+                 "reason": f"已执行 {len(history)} 个动作；审计截图失败: {e}",
+                 "need_human": False}
 
     if mcp:
         mcp.close()
@@ -573,6 +1014,7 @@ def run_gui_task(task: str,
     return {
         "success": audit.get("success", False),
         "message": audit.get("reason", ""),
-        "steps_done": f"{ok}/{len(steps)}",
-        "need_human": audit.get("need_human", not audit.get("success")),
+        "steps_done": f"{len(history)}/{iteration+1}",
+        "need_human": audit.get("need_human", False),
+        "elapsed": f"{elapsed:.1f}s",
     }

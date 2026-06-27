@@ -1050,17 +1050,18 @@ class ResultWindow(QWidget):
         self.setGeometry(geo)
 
     def showEvent(self, event):
-        """窗口显示时：隐藏任务栏图标 + 可选防屏幕捕获。"""
+        """窗口显示时：隐藏任务栏图标 + 防屏幕捕获。"""
         super().showEvent(event)
         if not self._win_hidden_done and self.winId():
             self._win_hidden_done = True
             try:
                 import ctypes
                 hwnd = int(self.winId())
-                # 从任务栏隐藏
+                # 从任务栏隐藏 (WS_EX_TOOLWINDOW)
                 ctypes.windll.user32.SetWindowLongPtrW(hwnd, -20,
                     ctypes.windll.user32.GetWindowLongPtrW(hwnd, -20) | 0x80)
-                # 防屏幕捕获（默认开启，右键托盘可切换）
+                # 防屏幕捕获 (WDA_EXCLUDEFROMCAPTURE=0x11: 截图/录屏/远程都看不到)
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
                 self._privacy_enabled = True
             except Exception:
                 pass

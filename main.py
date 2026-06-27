@@ -162,6 +162,7 @@ class DesktopAgentProcessThread(QThread):
             cmd = [python, script, self._task, "--result", result_file]
             if self._use_mcp:
                 cmd.append("--mcp")
+                cmd.append("--keep-browser")
             cmd.extend(["--cancel-file", self._cancel_file])
 
             self.progress.emit(f"启动独立 Agent 进程: {python}")
@@ -270,19 +271,6 @@ class _RemoteAgentThread(QThread):
                     f.write("cancel")
             except Exception:
                 pass
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.stdin.write("STOP\n")
-                self._proc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                self._proc.terminate()
-                time.sleep(0.3)
-                if self._proc.poll() is None:
-                    self._proc.kill()
-            except Exception:
-                pass
 
     def run(self):
         import subprocess as _sp
@@ -298,7 +286,7 @@ class _RemoteAgentThread(QThread):
         # 结果保存到项目目录
         save_dir = os.path.dirname(os.path.dirname(os.path.abspath(script)))
 
-        cmd = [python, script, self._task, "--keep-browser", "--save-dir", save_dir]
+        cmd = [python, script, self._task, "--keep-browser", "--stay-open", "--save-dir", save_dir]
         if self._use_mcp:
             cmd.append("--mcp")
         cmd.extend(["--cancel-file", self._cancel_file])
@@ -624,6 +612,10 @@ class ScreenAIAgent(QObject):
             stop_cloudflare_tunnel()
         except Exception:
             pass
+        try:
+            self._stop_remote_agent()
+        except Exception:
+            pass
         if self._remote_server:
             try:
                 self._remote_server.stop()
@@ -929,11 +921,8 @@ class ScreenAIAgent(QObject):
         thread = getattr(self, "_agent_thread", None)
         if thread and thread.isRunning():
             if hasattr(thread, "stop_agent"):
-                # 多轮远程 Agent: 停止整个会话
-                self._result_window.append_text("\n⏹️ **远程会话已终止**\n")
-                thread.stop_agent()
-                self._agent_thread = None
-                self._remote_session = False
+                self._result_window.append_text("\n⏸️ **正在取消当前远程操作，进程保持等待下一条指令...**\n")
+                thread.cancel()
             else:
                 self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
                 thread.cancel()
@@ -965,7 +954,8 @@ class ScreenAIAgent(QObject):
 
     def _on_desktop_agent_done(self, success: bool, msg: str):
         # 清理
-        self._agent_thread = None
+        if not getattr(self, "_remote_session", False):
+            self._agent_thread = None
         if self._result_window:
             self._result_window.stop_loading()
             status = "完成" if success else "失败"
@@ -1151,12 +1141,46 @@ class ScreenAIAgent(QObject):
     def _run_remote_task(self, task: str):
         """主线程: 执行手机发来的指令."""
         thread = getattr(self, "_agent_thread", None)
-        if thread and thread.isRunning():
-            self._remote_server.send_progress("⚠️ 上一个任务还在执行中, 请稍后再试")
+        if self._is_remote_stop_command(task):
+            self._stop_remote_agent()
             return
         print(f"[Remote] 执行: {task}")
         self._remote_server.send_progress(f"执行: {task}")
-        self._run_desktop_automation(task, original_text=task)
+        if thread and thread.isRunning() and hasattr(thread, "send_task"):
+            self._last_user_text = task
+            self._agent_log_lines = []
+            thread.send_task(task)
+            return
+        if thread and thread.isRunning():
+            self._remote_server.send_progress("⚠️ 上一个任务还在执行中, 请稍后再试")
+            return
+        self._start_remote_agent(task)
+
+    def _is_remote_stop_command(self, task: str) -> bool:
+        text = (task or "").strip().lower()
+        stop_keys = [
+            "结束远程", "停止远程", "关闭远程", "退出远程",
+            "结束会话", "停止会话", "关闭会话",
+            "stop remote", "close remote", "quit remote", "end remote",
+        ]
+        return any(k in text for k in stop_keys)
+
+    def _start_remote_agent(self, task: str):
+        self._remote_session = True
+        self._last_user_text = task
+        self._agent_log_lines = []
+        self._agent_thread = _RemoteAgentThread(task, self._remote_server, use_mcp=True)
+        self._agent_thread.progress.connect(self._on_desktop_agent_progress)
+        self._agent_thread.done.connect(self._on_desktop_agent_done)
+        self._agent_thread.start()
+
+    def _stop_remote_agent(self):
+        thread = getattr(self, "_agent_thread", None)
+        if thread and thread.isRunning() and hasattr(thread, "stop_agent"):
+            self._remote_server.send_progress("正在结束远程 Agent 进程。")
+            thread.stop_agent()
+        self._agent_thread = None
+        self._remote_session = False
 
     def _push_remote_screenshot(self):
         """截图推送给远程手机."""

@@ -42,3 +42,4 @@ dist_final/
 .playwright-mcp/
 *.tgz
 airag-page.png
+nul

@@ -190,7 +190,8 @@ def _build_execute_js(ai_id: int, action: str, value: str = "") -> str:
 class PlaywrightMCPClient:
     """JSON-RPC 2.0 communication with Playwright MCP Server."""
 
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, keep_browser_open: bool = False,
+                 cdp_endpoint: str = ""):
         self._process = None
         self._request_id = 0
         self._pending = {}
@@ -200,6 +201,8 @@ class PlaywrightMCPClient:
         self._stderr_thread = None
         self._running = False
         self._headless = headless
+        self._keep_browser_open = keep_browser_open
+        self._cdp_endpoint = cdp_endpoint
         self._tools = {}
         self._tool_prefix = "browser"
         self._npx = shutil.which("npx")
@@ -212,6 +215,8 @@ class PlaywrightMCPClient:
         last_error = None
         for package in MCP_SERVER_PACKAGES:
             cmd = [self._npx, "-y", package]
+            if self._cdp_endpoint:
+                cmd.extend(["--cdp-endpoint", self._cdp_endpoint])
             print(f"[MCP-Client] 启动: {' '.join(cmd)}")
             try:
                 self._process = subprocess.Popen(
@@ -376,13 +381,16 @@ class PlaywrightMCPClient:
 
     def close_browser(self):
         try:
+            if getattr(self, "_keep_browser_open", False):
+                return
             self.call_tool("browser_close", {}, timeout=5)
         except Exception:
             pass
 
     def shutdown(self):
         self._running = False
-        self.close_browser()
+        if not getattr(self, "_keep_browser_open", False):
+            self.close_browser()
         if self._process and self._process.poll() is None:
             try:
                 self._process.stdin.close()
@@ -418,7 +426,7 @@ class PlaywrightMCPClient:
 class BrowserMCP:
     """Browser automation engine. Prioritizes MCP Server, falls back to CDP."""
 
-    def __init__(self, use_mcp_server: bool = True):
+    def __init__(self, use_mcp_server: bool = True, keep_browser_open: bool = False):
         self._playwright = None
         self._browser = None
         self._context = None
@@ -428,6 +436,7 @@ class BrowserMCP:
         self._mcp_client = None
         self._use_mcp_server = use_mcp_server
         self._mcp_available = False
+        self._keep_browser_open = keep_browser_open
 
     # ----- CDP fallback -----
 
@@ -505,7 +514,17 @@ class BrowserMCP:
 
     def _connect_via_mcp(self) -> bool:
         try:
-            self._mcp_client = PlaywrightMCPClient(headless=False)
+            cdp_endpoint = ""
+            if self._keep_browser_open:
+                cdp_endpoint = "http://127.0.0.1:9222"
+                if not self._is_port_open(port=9222):
+                    if not self._launch_cdp_browser(port=9222):
+                        return False
+            self._mcp_client = PlaywrightMCPClient(
+                headless=False,
+                keep_browser_open=self._keep_browser_open,
+                cdp_endpoint=cdp_endpoint,
+            )
             self._mcp_client.initialize()
             self._mcp_available = True
             self._connected = True
@@ -544,6 +563,14 @@ class BrowserMCP:
             return True
         return False
 
+    def screenshot_page(self) -> Optional[Image.Image]:
+        if self._mcp_available and self._mcp_client:
+            return self._mcp_client.screenshot()
+        if self._page:
+            data = self._page.screenshot(type="png", full_page=False)
+            return Image.open(io.BytesIO(data))
+        return None
+
     def maximize(self):
         js = "() => { moveTo(0,0); if (screen && screen.width) { resizeTo(screen.width, screen.height); } }"
         if self._mcp_available and self._mcp_client:
@@ -577,7 +604,7 @@ class BrowserMCP:
                 self._playwright.stop()
         except Exception:
             pass
-        if self._launched_process:
+        if self._launched_process and not self._keep_browser_open:
             try:
                 self._launched_process.terminate()
             except Exception:
@@ -589,7 +616,7 @@ class BrowserMCP:
 # ReAct Agent — 截图观察 -> 思考 -> 行动 -> 循环
 # ============================================================
 
-REACT_PROMPT = """你是桌面自动化专家。看截图 → 思考 → 决定下一步动作，用 ReAct 模式逐步完成任务。
+REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图 → 决定下一步动作。
 
 【用户任务】: {task}
 
@@ -597,35 +624,57 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 思考 → 决定�
 {history}
 
 请仔细观察当前截图，思考：
-1. 当前屏幕上看到了什么？
-2. 已执行的操作产生了什么效果？
+1. 当前屏幕上看到了什么？（桌面？浏览器？某个应用？）
+2. 用户的意图是什么？（搜索？打开软件？关闭窗口？填写表单？）
 3. 任务是否已完成？
 4. 如果未完成，下一步应该做什么？
 
+你可以使用的工具 action:
+- "click":    鼠标点击元素 → 同时返回 x, y (归一化坐标 0-1000)
+- "type":     在当前焦点输入框打字 → text="要输入的文字"
+- "press":    按键盘按键 → text="enter" / "ctrl+w" / "alt+f4" / "win+r" / "tab" 等
+- "scroll":   滚动 → text="up" 或 "down"
+- "wait":     等待 → text="2" (秒)
+- "open_url": 在浏览器打开网址 → text="https://www.baidu.com"
+              如果需要搜索但没开浏览器，先用 press text="win+r" 打开运行,
+              或用 open_url 直接打开搜索引擎
+
+提示:
+- 看到桌面想搜索: 用 click 点浏览器图标或 press text="win+r" 输入网址
+- 看到浏览器页面: 用 click 点搜索框, 用 type 输入关键词, 用 press text="enter" 搜索
+- 看到目标页面: 任务可能已完成, 返回 done=true
+- 需要用特定软件: 用 press text="win" 打开开始菜单, 然后 type 输入软件名
+- 不确定下一步时: 用 wait 等待页面加载
+
+坐标规则:
+- x: 归一化 0-1000 (0=最左, 1000=最右)
+- y: 归一化 0-1000 (0=最上, 1000=最下)
+- 右上角 ≈ x=980, y=10；中央 ≈ x=500, y=500；任务栏 ≈ y=980
+
 返回 JSON（只输出JSON）:
+任务未完成:
+{{"done": false, "thought": "当前看到xxx, 下一步应该xxx", "action": "click", "x": 500, "y": 300, "text": ""}}
 
-如果任务已完成:
-{{"done": true, "reason": "任务完成了，因为...(描述当前屏幕状态证明任务完成)"}}
+任务已完成:
+{{"done": true, "reason": "任务完成了，当前屏幕显示xxx证明xxx"}}
 
-如果还需要继续操作:
-{{"done": false, "thought": "描述看到了什么和下一步逻辑", "action": "click", "x": 500, "y": 300, "text": ""}}
+不确定时先等待:
+{{"done": false, "action": "wait", "text": "2"}}
 
-action 类型:
-- "click": 点击元素 → 同时返回 x, y (归一化坐标 0-1000)
-- "type":  在已聚焦的输入框中打字 → 用 text 字段传文字，无需坐标
-- "press": 按键盘键 → 用 text 字段传键名 ("enter", "ctrl+w", "alt+f4", "tab" 等)
-- "scroll": 滚动 → text="up" 或 "down"
-- "wait":  等待加载 → text="2" 表示等2秒
+重要：不要按文字查找元素，也不要输出 selector 或元素文字定位。只根据截图判断坐标并调用基础工具。
+正式动作集：
+- click: 左键单击，必须给 x,y
+- double: 左键双击，必须给 x,y
+- right: 右键单击，必须给 x,y
+- move: 移动鼠标，必须给 x,y
+- drag: 拖拽，必须给 x,y,x2,y2
+- fill: 在坐标处点击后输入文本，必须给 x,y,text
+- hotkey: 键盘或快捷键，必须给 text，例如 enter、ctrl+l、alt+f4、win+r
+- scroll: 滚动，text 为 up 或 down
+- wait: 等待，text 为秒数
+- open_url: 浏览器打开 URL，text 为 URL
 
-坐标规则（重要！）:
-- x: 归一化横坐标 0-1000 (0=最左, 1000=最右)
-- y: 归一化纵坐标 0-1000 (0=最上, 1000=最下)
-- 例: 屏幕右上角的X按钮 ≈ x=980, y=10
-- 例: 屏幕中央 ≈ x=500, y=500
-- 例: 左侧标签页 ≈ x≈150, y≈30
-
-如果页面还在加载或不确定下一步，先等待:
-{{"done": false, "action": "wait", "text": "2"}}"""
+优先输出这些 action 名；type 视为旧版 fill，press 视为旧版 hotkey。"""
 
 
 def react_decide(task: str, image: Image.Image, history: List[str],
@@ -669,6 +718,9 @@ def react_decide(task: str, image: Image.Image, history: List[str],
         if not result.get("done") and "x" in result and "y" in result:
             result["x_pixel"] = int(result["x"] * img_w / 1000)
             result["y_pixel"] = int(result["y"] * img_h / 1000)
+        if not result.get("done") and "x2" in result and "y2" in result:
+            result["x2_pixel"] = int(result["x2"] * img_w / 1000)
+            result["y2_pixel"] = int(result["y2"] * img_h / 1000)
 
         print(f"[ReAct] {json.dumps(result, ensure_ascii=False)[:400]}")
         return result
@@ -694,6 +746,37 @@ def _pyautogui_click(x: int, y: int):
     pyautogui.click()
 
 
+def _pyautogui_double_click(x: int, y: int):
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.2
+    pyautogui.moveTo(x, y, duration=0.15)
+    pyautogui.doubleClick()
+
+
+def _pyautogui_right_click(x: int, y: int):
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.2
+    pyautogui.moveTo(x, y, duration=0.15)
+    pyautogui.rightClick()
+
+
+def _pyautogui_move(x: int, y: int):
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.2
+    pyautogui.moveTo(x, y, duration=0.15)
+
+
+def _pyautogui_drag(x: int, y: int, x2: int, y2: int):
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.2
+    pyautogui.moveTo(x, y, duration=0.15)
+    pyautogui.dragTo(x2, y2, duration=0.35, button="left")
+
+
 def _pyautogui_type(text: str):
     import pyautogui
     try:
@@ -702,6 +785,10 @@ def _pyautogui_type(text: str):
         pyautogui.hotkey("ctrl", "v")
     except Exception:
         pyautogui.write(text, interval=0.03)
+
+
+def _pyautogui_fill(text: str):
+    _pyautogui_type(text)
 
 
 def _pyautogui_press(key: str):
@@ -716,10 +803,65 @@ def _pyautogui_press(key: str):
         pyautogui.press(key)
 
 
+def _pyautogui_hotkey(key: str):
+    _pyautogui_press(key)
+
+
 def _pyautogui_scroll(direction: str):
     import pyautogui
-    amount = 3 if direction == "down" else -3
+    direction = (direction or "down").strip().lower()
+    amount = -3 if direction in ("down", "roll_down") else 3
     pyautogui.scroll(amount)
+
+
+def _task_requests_close(task: str) -> bool:
+    text = (task or "").lower()
+    close_keys = [
+        "关闭", "关掉", "退出", "结束", "停止",
+        "close", "quit", "exit", "stop", "shutdown",
+    ]
+    return any(k in text for k in close_keys)
+
+
+def _is_close_hotkey(text: str) -> bool:
+    key = (text or "").lower().replace(" ", "")
+    return key in {"alt+f4", "ctrl+w", "cmd+w", "command+w", "ctrl+q", "cmd+q", "command+q"}
+
+
+def _open_url_in_browser(url: str, mcp):
+    """在浏览器中打开 URL。首次调用时自动连接 MCP。"""
+    url = (url or "").strip()
+    if not url:
+        return
+    if not url.startswith("http"):
+        url = "https://" + url
+    # 延迟连接 MCP: AI 第一次需要浏览器时才连
+    if mcp and not mcp.connected:
+        mcp.connect()
+    if mcp and mcp.connected:
+        try:
+            mcp.navigate(url)
+            print(f"[ReAct] MCP open: {url}")
+            return
+        except Exception as e:
+            print(f"[ReAct] MCP open failed: {e}")
+    # 回退
+    _pyautogui_press("win+r")
+    time.sleep(0.8)
+    try:
+        import pyperclip
+        pyperclip.copy(url)
+        import pyautogui
+        pyautogui.hotkey("ctrl", "v")
+    except Exception:
+        import pyautogui
+        pyautogui.write(url, interval=0.02)
+    time.sleep(0.3)
+    _pyautogui_press("enter")
+    time.sleep(3)
+    import pyautogui
+    pyautogui.hotkey("win", "up")
+    print(f"[ReAct] Win+R opened: {url}")
 
 
 # ============================================================
@@ -727,59 +869,57 @@ def _pyautogui_scroll(direction: str):
 # ============================================================
 
 def is_browser_task(task: str) -> bool:
+    """仅判断是否需要预打开浏览器 (有明确 URL 或浏览器关键词)。
+
+    意图识别交给 ReAct Agent — AI 看截图自己决定做什么。
+    这里只做最简单的确定性判断，不做关键词猜测。
+    """
     text = (task or "").lower()
-    keywords = [
-        "浏览器", "网页", "网址", "网站", "http://", "https://", "www.",
-        "百度", "搜索", "google", "bing", "edge", "chrome", "打开网页",
-        "b站", "bilibili", "淘宝", "京东", "知乎", "微博",
-    ]
-    return any(k in text for k in keywords)
+    # 明确URL
+    if re.search(r"https?://|www\.", text):
+        return True
+    # 明确提到浏览器
+    browser_keys = ["浏览器", "打开网页", "edge", "chrome"]
+    return any(k in text for k in browser_keys)
 
 
 def browser_bootstrap_steps(task: str) -> List[dict]:
-    """Determine URL and search query from task text."""
+    """仅提取 URL 并生成打开浏览器的步骤。意图识别和操作交给 ReAct Agent。"""
     text = (task or "").strip()
     lower = text.lower()
     url = ""
-    search_query = ""
 
+    # 提取明确 URL
     m = re.search(r"https?://[^\s，。]+|www\.[^\s，。]+", text, re.I)
     if m:
         url = m.group(0)
         if url.startswith("www."):
             url = "https://" + url
 
-    if not search_query:
-        for pat in [
-            r"搜索\s*(.+?)(?:然后|点击|进入|并|，|。|$)",
-            r"搜\s*(.+?)(?:然后|点击|进入|并|，|。|$)",
-            r"(?:search|find)\s+(.+?)(?:then|click|and|,|\.|$)",
+    # 搜索引擎检测 (只对明确的搜索站点，不猜测意图)
+    if not url:
+        for site, site_url in [
+            ("百度", "https://www.baidu.com"),
+            ("baidu", "https://www.baidu.com"),
+            ("google", "https://www.google.com"),
+            ("谷歌", "https://www.google.com"),
+            ("bing", "https://www.bing.com"),
+            ("必应", "https://www.bing.com"),
+            ("bilibili", "https://www.bilibili.com"),
+            ("b站", "https://www.bilibili.com"),
         ]:
-            m_query = re.search(pat, text, re.I)
-            if m_query:
-                search_query = m_query.group(1).strip(" ：:，。,. ")
+            if site in lower:
+                url = site_url
                 break
 
     if not url:
-        if "百度" in text or "baidu" in lower:
-            url = "https://www.baidu.com"
-        elif "google" in lower or "谷歌" in text:
-            url = "https://www.google.com"
-        elif "bing" in lower or "必应" in text:
-            url = "https://www.bing.com"
-        elif "bilibili" in lower or "b站" in text:
-            url = "https://www.bilibili.com"
-        else:
-            url = "https://www.baidu.com"
+        return []  # 无法确定URL, 不干预, 让ReAct Agent自己处理
 
-    steps = [
+    return [
         {"action": "open_url", "url": url, "desc": f"打开 {url}"},
         {"action": "wait", "seconds": 3, "desc": "等待页面加载"},
         {"action": "maximize", "desc": "最大化浏览器窗口"},
     ]
-    if search_query:
-        steps[0]["search_query"] = search_query
-    return steps
 
 
 # ============================================================
@@ -845,57 +985,18 @@ MAX_CONSECUTIVE_SAME_ACTION = 3
 
 def run_gui_task(task: str,
                  use_browser: bool = True,
+                 keep_browser_open: bool = False,
                  cancel_file: str = "",
                  progress_callback: Callable = None,
                  hide_window: Callable = None,
-                 show_window: Callable = None) -> dict:
-    """ReAct RPA pipeline.
-
-    1. If browser task: open URL + maximize (deterministic bootstrap)
-    2. ReAct loop: screenshot → AI thinks → act → repeat until done
-    3. Final audit
-    """
+                 show_window: Callable = None,
+                 shared_mcp: Optional[BrowserMCP] = None) -> dict:
+    """ReAct RPA pipeline — 所有任务统一走 ReAct 循环, AI 自己决定用什么工具."""
     import pyautogui
 
-    browser_needed = use_browser and is_browser_task(task)
-    mcp = None
-    if browser_needed:
-        if progress_callback:
-            progress_callback("检测到浏览器任务，准备连接浏览器自动化...")
-        mcp = BrowserMCP()
-        mcp.connect()
-        if progress_callback:
-            progress_callback("正在打开浏览器页面...")
-        bootstrap = browser_bootstrap_steps(task)
-        for s in bootstrap:
-            if s["action"] == "open_url":
-                if mcp and mcp.connected:
-                    mcp.navigate(s["url"])
-                else:
-                    _pyautogui_press("win+r")
-                    time.sleep(0.8)
-                    try:
-                        import pyperclip
-                        pyperclip.copy(s["url"])
-                        pyautogui.hotkey("ctrl", "v")
-                    except Exception:
-                        pyautogui.write(s["url"], interval=0.02)
-                    time.sleep(0.3)
-                    _pyautogui_press("enter")
-                    time.sleep(3)
-                    pyautogui.hotkey("win", "up")
-                if progress_callback:
-                    progress_callback(f"  已打开: {s['url']}")
-            elif s["action"] == "wait":
-                time.sleep(s.get("seconds", 2))
-            elif s["action"] == "maximize":
-                if mcp and mcp.connected:
-                    mcp.maximize()
-                else:
-                    pyautogui.hotkey("win", "up")
-                    time.sleep(0.5)
-    elif progress_callback:
-        progress_callback("非浏览器任务，使用纯视觉/鼠标键盘操作...")
+    mcp = shared_mcp or BrowserMCP(keep_browser_open=keep_browser_open)  # 延迟连接: AI 调用 open_url 时才 connect()
+
+    browser_mode = bool(use_browser and is_browser_task(task))
 
     # --- ReAct Loop ---
     history = []
@@ -907,7 +1008,7 @@ def run_gui_task(task: str,
         # ESC cancel check
         if cancel_file and os.path.exists(cancel_file):
             print("[Cancelled] 检测到 ESC 取消信号")
-            if mcp:
+            if mcp and not keep_browser_open:
                 mcp.close()
             return {
                 "success": False, "canceled": True,
@@ -924,7 +1025,14 @@ def run_gui_task(task: str,
             hide_window()
             time.sleep(0.2)
 
-        img = _screenshot_desktop()
+        img = None
+        if browser_mode:
+            if not mcp.connected:
+                mcp.connect()
+            if mcp.connected:
+                img = mcp.screenshot_page()
+        if img is None:
+            img = _screenshot_desktop()
 
         if show_window:
             show_window()
@@ -943,6 +1051,8 @@ def run_gui_task(task: str,
         text = decision.get("text", "")
         x = decision.get("x_pixel", 0)
         y = decision.get("y_pixel", 0)
+        x2 = decision.get("x2_pixel", 0)
+        y2 = decision.get("y2_pixel", 0)
 
         if progress_callback:
             progress_callback(f"  💭 {thought[:100]}")
@@ -958,14 +1068,36 @@ def run_gui_task(task: str,
         try:
             if action == "click":
                 _pyautogui_click(x, y)
+            elif action in ("double", "double_click"):
+                _pyautogui_double_click(x, y)
+            elif action in ("right", "right_click"):
+                _pyautogui_right_click(x, y)
+            elif action == "move":
+                _pyautogui_move(x, y)
+            elif action == "drag":
+                _pyautogui_drag(x, y, x2, y2)
+            elif action == "fill":
+                if x and y:
+                    _pyautogui_click(x, y)
+                _pyautogui_fill(text)
+            elif action == "hotkey":
+                if _is_close_hotkey(text) and not _task_requests_close(task):
+                    print(f"[ReAct] blocked close hotkey without close intent: {text}")
+                    continue
+                _pyautogui_hotkey(text)
             elif action == "type":
                 _pyautogui_type(text)
             elif action == "press":
+                if _is_close_hotkey(text) and not _task_requests_close(task):
+                    print(f"[ReAct] blocked close hotkey without close intent: {text}")
+                    continue
                 _pyautogui_press(text)
             elif action == "scroll":
                 _pyautogui_scroll(text or "down")
             elif action == "wait":
                 time.sleep(min(float(text or 1), 5))
+            elif action == "open_url":
+                _open_url_in_browser(text, mcp)
             else:
                 print(f"[ReAct] 未知动作: {action}")
         except Exception as e:
@@ -1008,8 +1140,8 @@ def run_gui_task(task: str,
                  "reason": f"已执行 {len(history)} 个动作；审计截图失败: {e}",
                  "need_human": False}
 
-    if mcp:
-        mcp.close()
+    # 任务完成后不关闭浏览器，保留页面供用户查看
+    # ESC 取消时才关闭 (见上方 cancel_file 检查)
 
     return {
         "success": audit.get("success", False),

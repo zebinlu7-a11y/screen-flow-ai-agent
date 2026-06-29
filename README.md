@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Ai_Flow" width="96" height="86">
 </p>
 
-<h2 align="center">Ai_Flow — 科研与办公自动化桌面助手</h2>
+<h2 align="center">Ai_Flow — 自动化桌面办公助手</h2>
 
 <p align="center">
   <b>截图+AI 流式对话 · ReAct 桌面自动化 · 手机远程控制 · 长期记忆 · 隐私保护</b>

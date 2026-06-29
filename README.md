@@ -125,7 +125,7 @@ ReAct Loop (最多15步):
 
 | 场景 | 做法 | 手机打开 |
 |------|------|----------|
-| 同 WiFi | 手机和PC同一WiFi | `http://192.168.1.x:8765` |
+| 同 WiFi | 手机和PC同一WiFi | `http://xxx.xxx.x.x:端口号` |
 | 手机热点 | 手机开热点 → PC连 | 同上(局域网IP不变) |
 | Cloudflare Tunnel | 自动获取公网URL | `https://xxx.trycloudflare.com` |
 
@@ -205,7 +205,7 @@ AIRAG/
 │   ├── state.py             # LangGraph AgentState 定义
 │   ├── graph.py             # LangGraph 状态机 + 流式对话 + 记忆检索
 │   ├── llm_client.py        # 豆包 VL ChatModel (OpenAI-compatible 封装)
-│   ├── gui_agent.py         # 🖥️ ReAct GUI Agent (纯视觉循环 + MCP 浏览器)
+│   ├── gui_agent.py         # ReAct GUI Agent (纯视觉循环 + MCP 浏览器)
 │   └── run_gui_agent.py     # GUI Agent 独立子进程入口
 │
 ├── gui/                     # Qt 界面

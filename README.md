@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Ai_Flow" width="96" height="86">
 </p>
 
-<h2 align="center">Ai_Flow — 自动化桌面办公助手</h2>
+<h2 align="center">Ai_Flow — 科研办公科研助手</h2>
 
 <p align="center">
   <b>截图+AI 流式对话 · ReAct 桌面自动化 · 手机远程控制 · 长期记忆 · 隐私保护</b>
@@ -18,7 +18,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 - **纯文本对话** — 悬浮窗底部输入框打字，Enter 发送
 - **截图提问** — `Ctrl+D` 连续截图，缩略图累积，点发送统一提交
-- **OCR识别** — `Ctrl+R` 截图，PaddleOCR 本地识别返回可复制文字
+- **OCR 识别** — `Ctrl+R` 截图，PaddleOCR 本地识别返回可复制文字
 - **桌面自动化** — `Ctrl+G` 或输入 `自动 任务`，ReAct Agent 自动操作桌面/浏览器
 - **手机远程控制** — 手机浏览器打开局域网地址，实时看截图+发指令+控制PC
 - **浏览器自动化** — Playwright MCP Server + CDP 双引擎，自动打开网页操作
@@ -125,7 +125,7 @@ ReAct Loop (最多15步):
 
 | 场景 | 做法 | 手机打开 |
 |------|------|----------|
-| 同 WiFi | 手机和PC同一WiFi | `http://xxx.xxx.x.x:端口号` |
+| 同 WiFi | 手机和PC同一WiFi | `http://192.168.1.x:8765` |
 | 手机热点 | 手机开热点 → PC连 | 同上(局域网IP不变) |
 | Cloudflare Tunnel | 自动获取公网URL | `https://xxx.trycloudflare.com` |
 
@@ -205,7 +205,7 @@ AIRAG/
 │   ├── state.py             # LangGraph AgentState 定义
 │   ├── graph.py             # LangGraph 状态机 + 流式对话 + 记忆检索
 │   ├── llm_client.py        # 豆包 VL ChatModel (OpenAI-compatible 封装)
-│   ├── gui_agent.py         # ReAct GUI Agent (纯视觉循环 + MCP 浏览器)
+│   ├── gui_agent.py         # 🖥️ ReAct GUI Agent (纯视觉循环 + MCP 浏览器)
 │   └── run_gui_agent.py     # GUI Agent 独立子进程入口
 │
 ├── gui/                     # Qt 界面
@@ -249,6 +249,53 @@ AIRAG/
 | 远程控制 | aiohttp HTTP API + 轮询 + Cloudflare Tunnel |
 | 语音 | PyAudio + 腾讯云 ASR |
 | 打包 | PyInstaller |
+
+## 并发架构
+
+```
+1 个主进程 ─┬─ 主线程 (Qt QEventLoop)    UI渲染 + 热键 + 定时器
+            ├─ QThread: StreamWorker      asyncio 协程 → 流式对话
+            ├─ QThread: DesktopAgentThread stdout 管道 → 管理子进程
+            ├─ QThread: MemWorker         同步阻塞 → 长期记忆提取
+            └─ 守护线程: RemoteServer      aiohttp 协程 → 手机 HTTP API
+
+1 个子进程 ─── python run_gui_agent.py     同步阻塞 → ReAct Agent 执行
+```
+
+### 并发单元职责与通信
+
+| 并发单元 | 类型 | 并发模型 | 职责 |
+|----------|------|----------|------|
+| 主线程 | 线程 #1 | Qt C++ QEventLoop 事件驱动 | UI 渲染、信号槽、热键响应、每秒巡检手机指令和截图推送 |
+| StreamWorker | QThread #2 | asyncio 单线程协程 | 流式对话: FAISS 检索 → 豆包 VL 逐 token 推送 |
+| DesktopAgentThread | QThread #3 | stdout 管道同步阻塞读 | GUI Agent 子进程管理: 启动、读进度、读结果 |
+| MemWorker | QThread #4 | 同步阻塞 | 长期记忆: LLM 提取事实 → Jaccard 去重 → FAISS 索引 |
+| RemoteServer | 守护线程 #5 | aiohttp 单线程协程 | 手机 HTTP API: /api/updates(轮询) /api/command(发指令) |
+| **子进程** | **独立进程** | **同步阻塞** | **ReAct Agent: 截图→豆包决策→pyautogui执行→循环** |
+
+### 通信详情
+
+| 通信双方 | 方向 | 通信方式 | 同步/异步 | 线程安全机制 |
+|----------|------|----------|-----------|-------------|
+| StreamWorker → 主线程 | 子线程→主 | `pyqtSignal.emit(token)` | 异步 | Qt 深拷贝到主线程事件队列 |
+| DesktopAgentThread → 主线程 | 子线程→主 | `pyqtSignal.emit(msg)` | 异步 | Qt 信号槽，数据拷贝传递 |
+| 子进程 → DesktopAgentThread | 子进程→子线程 | `print("[进度] xxx")` → stdout 管道 | 异步 | OS 管道缓冲区，`for line in proc.stdout` 读 |
+| 子进程 → 主线程 (结果) | 子进程→磁盘→主线程 | JSON 结果文件 | 同步(等文件) | 子进程写完父进程才读 |
+| 主线程 → 子进程 (取消) | 主线程→文件→子进程 | cancel 文件 + `proc.terminate()` | 异步/同步双保险 | 每步 `os.path.exists()` 检查 |
+| RemoteServer → 主线程 | 守护线程→主 | `_remote_pending_task = task` | 异步(变量写入) | GIL 保证字符串赋值原子性 |
+| 主线程 → RemoteServer | 主→守护线程 | `send_progress/set_screenshot` | 异步 | `threading.Lock` 保护共享数据 |
+| 手机 ↔ RemoteServer | HTTP | POST `/api/command` + GET `/api/updates` | 异步(轮询1.5s) | aiohttp 协程，多请求间无共享状态 |
+| MemWorker → 主线程 | 子线程→主 | `pyqtSignal.emit(facts)` | 异步 | Qt 信号槽，数据拷贝 |
+| GUI Agent → 豆包 API | 子进程→火山引擎 | HTTPS POST | 同步(阻塞等2-5s) | 每次请求独立 |
+
+### 为什么这样设计
+
+| 决策 | 原因 |
+|------|------|
+| I/O 密集用协程 | 等 LLM 响应/HTTP 请求，单线程协程切换纳秒级，比多线程省内存省切换开销 |
+| 简单阻塞用子线程 | pyautogui/文件 I/O 不支持 async，放子线程 GIL 释放时不挡主线程 |
+| 事件循环冲突用子进程 | Playwright 同步 API 内部有 asyncio 事件循环，和 Qt C++ QEventLoop 不能同进程共存——两个 `run_forever()` 抢线程。子进程物理隔离 |
+| 跨线程通信用 Qt 信号槽 | Qt 自动深拷贝数据到目标线程队列，不加锁，线程安全 |
 
 ## License
 

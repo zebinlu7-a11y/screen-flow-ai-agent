@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Ai_Flow" width="96" height="86">
 </p>
 
-<h2 align="center">Ai_Flow — 截图解析与自动化悬浮窗</h2>
+<h2 align="center">Ai_Flow — 科研办公助手</h2>
 
 <p align="center">
   <b>截图 + 多模态 AI → 流式输出 · 桌面自动化 ReAct Agent · 长期记忆</b>

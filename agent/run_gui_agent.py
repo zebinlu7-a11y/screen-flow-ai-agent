@@ -22,7 +22,8 @@ def _write_result(result_path, result):
             json.dump(result, f, ensure_ascii=False)
 
 
-def _run_one_task(task, use_mcp, keep_browser, cancel_file, shared_mcp=None):
+def _run_one_task(task, use_mcp, keep_browser, cancel_file, shared_mcp=None,
+                  user_id="default", memory_key="desktop"):
     from agent.gui_agent import run_gui_task
 
     start = time.time()
@@ -34,6 +35,8 @@ def _run_one_task(task, use_mcp, keep_browser, cancel_file, shared_mcp=None):
             cancel_file=cancel_file,
             progress_callback=lambda msg: print(f"[进度] {msg}", flush=True),
             shared_mcp=shared_mcp,
+            user_id=user_id,
+            memory_key=memory_key,
         )
     except Exception as e:
         result = {
@@ -57,6 +60,8 @@ def main():
     keep_browser = False
     stay_open = False
     cancel_file = ""
+    user_id = "default"
+    memory_key = "desktop"
 
     for i, arg in enumerate(sys.argv):
         if arg == "--result" and i + 1 < len(sys.argv):
@@ -69,6 +74,10 @@ def main():
             stay_open = True
         if arg == "--cancel-file" and i + 1 < len(sys.argv):
             cancel_file = sys.argv[i + 1]
+        if arg == "--user-id" and i + 1 < len(sys.argv):
+            user_id = sys.argv[i + 1]
+        if arg == "--memory-key" and i + 1 < len(sys.argv):
+            memory_key = sys.argv[i + 1]
 
     print(f"[Agent进程] 任务: {task}", flush=True)
     print(f"[Agent进程] MCP: {use_mcp}", flush=True)
@@ -96,12 +105,19 @@ def main():
 
     def run_and_emit(current_task):
         if cancel_file and os.path.exists(cancel_file):
-            try:
-                os.remove(cancel_file)
-            except Exception:
-                pass
+            result = {
+                "success": False,
+                "canceled": True,
+                "message": "操作已取消",
+                "steps_done": "0/0",
+                "elapsed": "0.0s",
+            }
+            print(f"[Agent进程] 已收到取消信号，跳过任务: {current_task}", flush=True)
+            _write_result(result_path, result)
+            return result
         result, elapsed = _run_one_task(
-            current_task, use_mcp, keep_browser, cancel_file, shared_mcp=shared_mcp
+            current_task, use_mcp, keep_browser, cancel_file, shared_mcp=shared_mcp,
+            user_id=user_id, memory_key=memory_key
         )
         print(f"[Agent进程] 完成 ({elapsed:.1f}s): {result}", flush=True)
         _write_result(result_path, result)
@@ -113,6 +129,10 @@ def main():
 
     if stay_open:
         print(json.dumps(result, ensure_ascii=False), flush=True)
+        if not result.get("success"):
+            if shared_mcp:
+                shared_mcp.close()
+            sys.exit(0)
         print("READY", flush=True)
         for line in sys.stdin:
             next_task = line.strip()
@@ -122,6 +142,8 @@ def main():
                 break
             result = run_and_emit(next_task)
             print(json.dumps(result, ensure_ascii=False), flush=True)
+            if not result.get("success"):
+                break
             print("READY", flush=True)
         if shared_mcp:
             shared_mcp.close()

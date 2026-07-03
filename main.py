@@ -41,6 +41,12 @@ from config import (
 )
 from utils.image_tool import qimage_to_pil, pil_to_base64, compress_image
 from utils.context_store import load_context, save_context
+from utils.session_memory import (
+    clear_session_messages,
+    load_session_messages,
+    redis_available,
+    sync_session_messages,
+)
 from utils.ocr_tool import ocr_recognize_batch
 from utils.speech_worker import get_speech_worker
 from utils.user_manager import (
@@ -121,10 +127,13 @@ class DesktopAgentProcessThread(QThread):
     progress = pyqtSignal(str)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, task: str, use_mcp: bool = False):
+    def __init__(self, task: str, use_mcp: bool = False,
+                 user_id: str = "default", memory_key: str = "desktop"):
         super().__init__()
         self._task = task
         self._use_mcp = use_mcp
+        self._user_id = user_id
+        self._memory_key = memory_key
         self._proc = None          # subprocess handle for termination
         self._cancel_file = ""     # signal file to tell agent to stop
 
@@ -164,6 +173,8 @@ class DesktopAgentProcessThread(QThread):
                 cmd.append("--mcp")
                 cmd.append("--keep-browser")
             cmd.extend(["--cancel-file", self._cancel_file])
+            cmd.extend(["--user-id", self._user_id or "default"])
+            cmd.extend(["--memory-key", self._memory_key or "desktop"])
 
             self.progress.emit(f"启动独立 Agent 进程: {python}")
             env = os.environ.copy()
@@ -243,11 +254,14 @@ class _RemoteAgentThread(QThread):
     progress = pyqtSignal(str)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, task: str, remote_server, use_mcp: bool = False):
+    def __init__(self, task: str, remote_server, use_mcp: bool = False,
+                 user_id: str = "default", memory_key: str = "remote_desktop"):
         super().__init__()
         self._task = task
         self._use_mcp = use_mcp
         self._remote = remote_server
+        self._user_id = user_id
+        self._memory_key = memory_key
         self._proc = None
         self._cancel_file = ""
         self._stop_event = threading.Event()
@@ -263,14 +277,33 @@ class _RemoteAgentThread(QThread):
         """停止 Agent."""
         self._stop_event.set()
         self._task_queue.put(None)  # 唤醒等待的线程
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
 
     def cancel(self):
+        self._stop_event.set()
         if self._cancel_file and not os.path.exists(self._cancel_file):
             try:
                 with open(self._cancel_file, "w") as f:
                     f.write("cancel")
             except Exception:
                 pass
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
 
     def run(self):
         import subprocess as _sp
@@ -290,6 +323,8 @@ class _RemoteAgentThread(QThread):
         if self._use_mcp:
             cmd.append("--mcp")
         cmd.extend(["--cancel-file", self._cancel_file])
+        cmd.extend(["--user-id", self._user_id or "default"])
+        cmd.extend(["--memory-key", self._memory_key or "remote_desktop"])
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -394,6 +429,8 @@ class _RemoteAgentThread(QThread):
                 msg = f"({elapsed}) {msg}"
             self._remote.send_result(success, msg, elapsed)
             self.done.emit(success, msg)
+            if not success or result.get("canceled"):
+                self._stop_event.set()
 
 
 # ============================================================
@@ -426,6 +463,7 @@ class ScreenAIAgent(QObject):
                 self._messages = self._conv_to_langchain(conv.get("messages", []))
                 self._active_conv_id = conv["id"]
                 loaded_from_conv = True
+                self._restore_redis_short_term()
                 print(f"[AIRAG] 已加载对话: {conv.get('title', '')} ({len(self._messages)} 条)")
 
         if not loaded_from_conv:
@@ -435,6 +473,7 @@ class ScreenAIAgent(QObject):
                 self._messages = self._conv_to_langchain(last_conv.get("messages", []))
                 self._active_conv_id = last_conv["id"]
                 set_active_conversation_id(self._user_id, self._active_conv_id)
+                self._restore_redis_short_term()
                 print(f"[AIRAG] 已加载最近对话: {last_conv.get('title', '')}")
             else:
                 # 全新用户
@@ -911,7 +950,12 @@ class ScreenAIAgent(QObject):
         mode_text = "浏览器自动化 + 视觉保底" if use_mcp else "纯视觉/鼠标键盘"
         self._result_window.append_text(f"- 模式：{mode_text}\n")
         self._agent_log_lines.append(f"模式：{mode_text}")
-        self._agent_thread = DesktopAgentProcessThread(task, use_mcp=use_mcp)
+        self._agent_thread = DesktopAgentProcessThread(
+            task,
+            use_mcp=use_mcp,
+            user_id=self._user_id,
+            memory_key=self._active_conv_id or "desktop",
+        )
         self._agent_thread.progress.connect(self._on_desktop_agent_progress)
         self._agent_thread.done.connect(self._on_desktop_agent_done)
         self._agent_thread.start()
@@ -921,7 +965,7 @@ class ScreenAIAgent(QObject):
         thread = getattr(self, "_agent_thread", None)
         if thread and thread.isRunning():
             if hasattr(thread, "stop_agent"):
-                self._result_window.append_text("\n⏸️ **正在取消当前远程操作，进程保持等待下一条指令...**\n")
+                self._result_window.append_text("\n⏹️ **正在取消当前远程操作并终止 Agent 进程...**\n")
                 thread.cancel()
             else:
                 self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
@@ -1025,6 +1069,21 @@ class ScreenAIAgent(QObject):
             )
         self._stream_worker = None
 
+    def _restore_redis_short_term(self):
+        """Prefer Redis short-term memory when it has a warmer recent window."""
+        if not redis_available():
+            return
+
+        messages = load_session_messages(self._user_id, self._active_conv_id)
+        if not messages:
+            return
+
+        if len(self._messages) > len(messages):
+            self._messages = self._messages[:-len(messages)] + messages
+        else:
+            self._messages = messages
+        print(f"[SessionMemory] restored {len(messages)} recent messages from Redis")
+
     # ============================================================
     # Conversation Helpers
     # ============================================================
@@ -1060,6 +1119,7 @@ class ScreenAIAgent(QObject):
         }
         save_conversation(self._user_id, conv)
         save_context(self._messages, CONTEXT_FILE)
+        sync_session_messages(self._user_id, self._active_conv_id, self._messages)
 
     # ============================================================
     # Sidebar
@@ -1169,7 +1229,13 @@ class ScreenAIAgent(QObject):
         self._remote_session = True
         self._last_user_text = task
         self._agent_log_lines = []
-        self._agent_thread = _RemoteAgentThread(task, self._remote_server, use_mcp=True)
+        self._agent_thread = _RemoteAgentThread(
+            task,
+            self._remote_server,
+            use_mcp=True,
+            user_id=self._user_id,
+            memory_key=self._active_conv_id or "remote_desktop",
+        )
         self._agent_thread.progress.connect(self._on_desktop_agent_progress)
         self._agent_thread.done.connect(self._on_desktop_agent_done)
         self._agent_thread.start()
@@ -1215,7 +1281,7 @@ class ScreenAIAgent(QObject):
             lines = ["\n📱 **手机远程控制**\n"]
             for u in urls:
                 lines.append(f"- {u['label']}: {u['url']}")
-            lines.append(f"\n手机浏览器打开上述地址即可远程控制。")
+            lines.append(f"\n打开上述地址即可唤醒AI助手远程控制。")
             self._result_window.append_text("\n".join(lines))
             print(f"[Remote] 连接信息: {[(u['label'], u['url']) for u in urls]}")
         else:
@@ -1368,6 +1434,7 @@ class ScreenAIAgent(QObject):
         """清空对话历史（窗口保持显示）。"""
         self._messages = []
         save_context(self._messages, CONTEXT_FILE)
+        clear_session_messages(self._user_id, self._active_conv_id)
         print("[AIRAG] 对话历史已清空")
         self._result_window.clear_content()
         self._tray.showMessage(

@@ -25,6 +25,10 @@ HTTP_PROXY = get_proxy()   # 从 airag_config.json 读取，或通过设置界�
 ARK_API_KEY = get_api_key() or os.environ.get("ARK_API_KEY", "")
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DOUBAO_MODEL_NAME = get_model() or os.environ.get("DOUBAO_MODEL_NAME", "doubao-seed-2-0-mini-260428")
+# Lightweight text embedding model for optional dense retrieval. Override with
+# AIRAG_EMBEDDING_MODEL_NAME if your Ark endpoint uses a custom model name.
+EMBEDDING_MODEL_NAME = os.environ.get("AIRAG_EMBEDDING_MODEL_NAME", "doubao-embedding-text-240715")
+EMBEDDING_ENABLED = os.environ.get("AIRAG_EMBEDDING_ENABLED", "1") != "0"
 
 # GUI 自动化子进程解释器。主界面需要 PyQt/pynput，自动化进程优先使用 browser-use 环境。
 _BROWSER_USE_PYTHON = r"E:\Anaconda3\envs\browser-use\python.exe"
@@ -84,6 +88,14 @@ MAX_IMAGE_BASE64_KEEP_TURNS = 0  # JSON 中不保留图片 base64（只存文本
 # 上下文持久化
 # ============================================================
 CONTEXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "context_history.json")
+
+# Optional Redis short-term memory. If Redis is unavailable, AIRAG falls back
+# to the existing in-process/JSON conversation memory.
+REDIS_URL = os.environ.get("AIRAG_REDIS_URL", "redis://localhost:6379/0")
+REDIS_SHORT_TERM_ENABLED = os.environ.get("AIRAG_REDIS_ENABLED", "1") != "0"
+REDIS_SHORT_TERM_TTL_SECONDS = int(os.environ.get("AIRAG_REDIS_TTL_SECONDS", str(7 * 24 * 3600)))
+REDIS_SHORT_TERM_MAX_MESSAGES = int(os.environ.get("AIRAG_REDIS_MAX_MESSAGES", "30"))
+REDIS_KEEP_IMAGE_TURNS = int(os.environ.get("AIRAG_REDIS_KEEP_IMAGE_TURNS", "2"))
 
 # ============================================================
 # UI 配置

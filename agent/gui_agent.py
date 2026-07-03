@@ -1,11 +1,11 @@
 """
-GUI Agent RPA — Playwright MCP Server + ReAct 纯视觉引擎。
+GUI Agent RPA — ReAct core decision + Loop Engineer controller.
 
-架构（对齐 AI_RPA_pyqt.py）:
-  1. ReAct Agent：截图 → 模型观察思考 → 决定下一步 (click/type/press/scroll/wait)
-  2. 纯视觉定位：模型直接返回归一化坐标(0-1000)，转换为屏幕绝对坐标
-  3. pyautogui 执行
-  4. 循环直到模型判定任务完成或达到最大步数
+Architecture:
+  1. ReAct core: screenshot + task + operation memory -> next action JSON.
+  2. Loop Engineer: observe, execute, detect repeated/no-op actions, recover,
+     audit, summarize operation memory, and decide when to stop.
+  3. Executor: PyAutoGUI + optional Playwright MCP browser tools.
 """
 import os
 import re
@@ -571,6 +571,50 @@ class BrowserMCP:
             return Image.open(io.BytesIO(data))
         return None
 
+    def extract_page_text(self, max_chars: int = 5000) -> str:
+        js = """
+() => {
+  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const links = Array.from(document.querySelectorAll('a'))
+    .slice(0, 30)
+    .map(a => ({ text: clean(a.innerText || a.textContent), href: a.href }))
+    .filter(x => x.text || x.href);
+  const main = document.querySelector('main, article, #content, .content, .result, body');
+  const text = clean(main ? main.innerText : document.body.innerText);
+  return JSON.stringify({
+    title: document.title,
+    url: location.href,
+    text: text.slice(0, 5000),
+    links
+  });
+}
+"""
+        raw = ""
+        if self._mcp_available and self._mcp_client:
+            raw = self._mcp_client.evaluate(js)
+        elif self._page:
+            raw = self._page.evaluate(js)
+        if not raw:
+            return ""
+        try:
+            data = json.loads(raw)
+            title = data.get("title", "")
+            url = data.get("url", "")
+            text = data.get("text", "")[:max_chars]
+            links = data.get("links", [])[:10]
+            link_text = "\n".join(
+                f"- {item.get('text', '')[:80]} {item.get('href', '')}"
+                for item in links
+            )
+            return f"TITLE: {title}\nURL: {url}\nTEXT:\n{text}\nLINKS:\n{link_text}".strip()
+        except Exception:
+            return str(raw)[:max_chars]
+
+    def mark_unavailable(self):
+        """Mark the current browser channel as unavailable so ReAct can fall back."""
+        self._connected = False
+        self._mcp_available = False
+
     def maximize(self):
         js = "() => { moveTo(0,0); if (screen && screen.width) { resizeTo(screen.width, screen.height); } }"
         if self._mcp_available and self._mcp_client:
@@ -670,14 +714,28 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - drag: 拖拽，必须给 x,y,x2,y2
 - fill: 在坐标处点击后输入文本，必须给 x,y,text
 - hotkey: 键盘或快捷键，必须给 text，例如 enter、ctrl+l、alt+f4、win+r
-- scroll: 滚动，text 为 up 或 down
+- scroll: 在指定区域滚动，最好给 x,y，text 为 up/down/long_down/long_up 或数字
+- multi_scroll: 一次性大幅滚动，必须给 text 为次数或方向:次数，例如 down:8
+- page_jump: 估算目标页差距后连续翻页，text 为页数差或目标页，例如 9 或 target:10
+- page_down: 向下翻页，不需要 text
+- page_up: 向上翻页，不需要 text
 - wait: 等待，text 为秒数
+- screenshot: 重新截图观察，不需要 text
+- alt_tab: 切换到上一个窗口，不需要 text
+- focus_window: 点击/激活当前目标窗口，必须给 x,y
 - open_url: 浏览器打开 URL，text 为 URL
+- observe_browser: 检测/连接已有 MCP 或 browser page，并截图观察，不需要 text
+- activate_browser: 尝试激活后台或最小化的浏览器窗口，不需要 text
+- zoom_out: 缩小页面视图，看更多内容，不需要 text
+- zoom_in: 放大页面视图，看清局部内容，不需要 text
+- maximize: 最大化/恢复浏览器窗口，不需要 text
+- read_page: 读取当前网页可见文本/标题/链接并放入历史，不需要 text
 
 优先输出这些 action 名；type 视为旧版 fill，press 视为旧版 hotkey。"""
 
 
 def react_decide(task: str, image: Image.Image, history: List[str],
+                 operation_context: str = "",
                  model: str = "doubao-seed-2-0-lite-260428") -> dict:
     """ReAct 决策：截图 + 任务 + 历史 → {done, thought, action, x, y, text}。
 
@@ -692,7 +750,28 @@ def react_decide(task: str, image: Image.Image, history: List[str],
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
     history_text = "\n".join(history[-10:]) if history else "(无 — 这是第一步)"
+    if operation_context:
+        history_text = f"{operation_context}\n\n## 本轮已执行历史\n{history_text}"
     prompt_text = REACT_PROMPT.format(task=task, history=history_text)
+
+    prompt_text += """
+
+Additional execution rules:
+1. Break the user task into a short plan in thought, and state the current step/status.
+2. Use the action history as progress memory. Do not repeat the same open_url for the same URL.
+3. For browser/search tasks, do not assume the browser is closed just because the desktop screenshot shows another app. First decide whether to call observe_browser or activate_browser.
+4. Use observe_browser to connect to an existing MCP/browser page and inspect it. Use activate_browser when history suggests a browser exists but it may be minimized or behind another window.
+5. Use open_url only after you decide a browser/search page is unavailable or a new explicit URL/search engine is needed.
+6. For search/research tasks, progress as: check browser state -> get/search results -> identify relevant links -> open/read pages -> call read_page -> summarize collected material -> done=true.
+7. If the screenshot conflicts with action history, treat the last successful action as an important clue and try observe_browser, activate_browser, wait, maximize, hotkey, or clicking the visible browser/taskbar before repeating navigation.
+8. Do not keep scrolling forever. After at most two scroll actions on a search results page, click a relevant result or call read_page to collect text.
+9. If the visible page is too cramped or only shows ads, use zoom_out or maximize before more scrolling.
+10. For file/folder/PPT tasks, use desktop tools too: double click folders/files, alt_tab, focus_window, page_down/page_up, hotkey f5/escape, and scroll in the visible slide/page area.
+11. For PPT/page navigation, estimate the gap to the target page from the screenshot and history. Use page_jump or multi_scroll instead of moving one page per step. Example: if current page is 1 and target is 10, use page_jump text="9".
+12. Use the operation memory context as the current desktop/application state. If the user asks a follow-up like "再翻到第十页", continue from the remembered workflow and current screenshot.
+13. Two consecutive failed or repeated steps must switch to a different method. Try at most five different recovery methods, then return done=true with a failure reason and ask the user to re-enter clearer instructions.
+14. Return JSON. You may include plan/status, but must include done/action/thought or done/reason.
+"""
 
     content = [
         {"type": "text", "text": prompt_text},
@@ -736,6 +815,17 @@ def react_decide(task: str, image: Image.Image, history: List[str],
 def _screenshot_desktop() -> Image.Image:
     import pyautogui
     return pyautogui.screenshot()
+
+
+def _image_fingerprint(image: Image.Image) -> tuple:
+    small = image.convert("L").resize((16, 16))
+    return tuple(int(p // 16) for p in small.getdata())
+
+
+def _fingerprint_distance(a: tuple, b: tuple) -> int:
+    if not a or not b or len(a) != len(b):
+        return 9999
+    return sum(abs(x - y) for x, y in zip(a, b))
 
 
 def _pyautogui_click(x: int, y: int):
@@ -807,11 +897,67 @@ def _pyautogui_hotkey(key: str):
     _pyautogui_press(key)
 
 
-def _pyautogui_scroll(direction: str):
+def _pyautogui_scroll(direction: str, x: int = 0, y: int = 0):
     import pyautogui
+    try:
+        if x and y:
+            pyautogui.moveTo(x, y, duration=0.1)
+        else:
+            w, h = pyautogui.size()
+            pyautogui.moveTo(w // 2, h // 2, duration=0.1)
+    except Exception:
+        pass
     direction = (direction or "down").strip().lower()
-    amount = -3 if direction in ("down", "roll_down") else 3
+    if direction.lstrip("-").isdigit():
+        amount = int(direction)
+    elif direction in ("down", "roll_down"):
+        amount = -8
+    elif direction in ("long_down", "pagedown", "page_down"):
+        amount = -12
+    elif direction in ("long_up", "pageup", "page_up"):
+        amount = 12
+    else:
+        amount = 8
     pyautogui.scroll(amount)
+
+
+def _pyautogui_page(direction: str):
+    import pyautogui
+    pyautogui.press("pagedown" if direction == "down" else "pageup")
+
+
+def _parse_count_text(text: str, default: int = 3, limit: int = 20) -> tuple:
+    raw = (text or "").strip().lower()
+    direction = "down"
+    count_text = raw
+    if ":" in raw:
+        direction, count_text = raw.split(":", 1)
+    if "up" in raw or "上" in raw:
+        direction = "up"
+    try:
+        count = abs(int(re.findall(r"-?\d+", count_text)[0]))
+    except Exception:
+        count = default
+    return direction, max(1, min(count, limit))
+
+
+def _pyautogui_multi_scroll(text: str, x: int = 0, y: int = 0):
+    direction, count = _parse_count_text(text, default=5, limit=15)
+    for _ in range(count):
+        _pyautogui_scroll("long_up" if direction == "up" else "long_down", x, y)
+        time.sleep(0.08)
+
+
+def _pyautogui_page_jump(text: str):
+    import pyautogui
+    raw = (text or "").strip().lower()
+    direction, count = _parse_count_text(raw, default=1, limit=30)
+    if raw.startswith("-"):
+        direction = "up"
+    key = "pageup" if direction == "up" else "pagedown"
+    for _ in range(count):
+        pyautogui.press(key)
+        time.sleep(0.08)
 
 
 def _task_requests_close(task: str) -> bool:
@@ -878,48 +1024,191 @@ def is_browser_task(task: str) -> bool:
     # 明确URL
     if re.search(r"https?://|www\.", text):
         return True
-    # 明确提到浏览器
-    browser_keys = ["浏览器", "打开网页", "edge", "chrome"]
+    # 明确提到浏览器、网页搜索或资料整理
+    browser_keys = [
+        "浏览器", "打开网页", "网页", "网址", "链接",
+        "搜索", "搜", "整理资料", "资料", "csdn",
+        "edge", "chrome", "baidu", "bing", "google",
+    ]
     return any(k in text for k in browser_keys)
 
 
-def browser_bootstrap_steps(task: str) -> List[dict]:
-    """仅提取 URL 并生成打开浏览器的步骤。意图识别和操作交给 ReAct Agent。"""
-    text = (task or "").strip()
-    lower = text.lower()
-    url = ""
+def observe_browser_page(mcp: BrowserMCP, progress_callback: Callable = None) -> bool:
+    """Connect to an existing browser page and verify page observation."""
+    if not mcp:
+        return False
 
-    # 提取明确 URL
-    m = re.search(r"https?://[^\s，。]+|www\.[^\s，。]+", text, re.I)
-    if m:
-        url = m.group(0)
-        if url.startswith("www."):
-            url = "https://" + url
+    if not mcp.connected:
+        if progress_callback:
+            progress_callback("Detecting an existing browser page...")
+        mcp.connect()
 
-    # 搜索引擎检测 (只对明确的搜索站点，不猜测意图)
-    if not url:
-        for site, site_url in [
-            ("百度", "https://www.baidu.com"),
-            ("baidu", "https://www.baidu.com"),
-            ("google", "https://www.google.com"),
-            ("谷歌", "https://www.google.com"),
-            ("bing", "https://www.bing.com"),
-            ("必应", "https://www.bing.com"),
-            ("bilibili", "https://www.bilibili.com"),
-            ("b站", "https://www.bilibili.com"),
-        ]:
-            if site in lower:
-                url = site_url
-                break
+    if not mcp.connected:
+        return False
 
-    if not url:
-        return []  # 无法确定URL, 不干预, 让ReAct Agent自己处理
+    try:
+        img = safe_browser_screenshot(mcp, progress_callback)
+        if img is None:
+            return False
+        mcp.maximize()
+        time.sleep(0.5)
+        if progress_callback:
+            progress_callback("Detected an existing browser page; observing it before any navigation.")
+        return True
+    except Exception as exc:
+        print(f"[ReAct] browser observe failed: {exc}")
+        return False
 
-    return [
-        {"action": "open_url", "url": url, "desc": f"打开 {url}"},
-        {"action": "wait", "seconds": 3, "desc": "等待页面加载"},
-        {"action": "maximize", "desc": "最大化浏览器窗口"},
-    ]
+
+def activate_browser_window(mcp: BrowserMCP = None, progress_callback: Callable = None) -> bool:
+    """Try to bring an existing browser window forward without navigating."""
+    try:
+        import pyautogui
+        if progress_callback:
+            progress_callback("Trying to activate an existing browser window from the desktop.")
+        pyautogui.hotkey("alt", "tab")
+        time.sleep(0.8)
+        pyautogui.hotkey("win", "up")
+        time.sleep(0.8)
+        if mcp and mcp.connected:
+            try:
+                mcp.maximize()
+            except Exception:
+                pass
+        return True
+    except Exception as exc:
+        print(f"[ReAct] browser activation fallback failed: {exc}")
+        return False
+
+
+def safe_browser_screenshot(mcp: BrowserMCP,
+                            progress_callback: Callable = None,
+                            history: Optional[List[str]] = None) -> Optional[Image.Image]:
+    """Take a browser screenshot with one recovery attempt, then let ReAct continue."""
+    if not mcp or not mcp.connected:
+        return None
+
+    try:
+        return mcp.screenshot_page()
+    except Exception as exc:
+        msg = f"MCP browser screenshot failed: {exc}"
+        print(f"[ReAct] {msg}")
+        if history is not None:
+            history.append(f"[tool_error] {msg}; fallback to desktop screenshot")
+        if progress_callback:
+            progress_callback("Browser screenshot failed; activating browser and falling back if needed.")
+
+    try:
+        activate_browser_window(mcp, progress_callback)
+        img = mcp.screenshot_page()
+        if img is not None:
+            if history is not None:
+                history.append("[recovery] browser screenshot recovered after activation")
+            return img
+    except Exception as exc:
+        msg = f"MCP browser screenshot retry failed: {exc}"
+        print(f"[ReAct] {msg}")
+        if history is not None:
+            history.append(f"[tool_error] {msg}; MCP channel marked unavailable")
+
+    try:
+        mcp.mark_unavailable()
+    except Exception:
+        pass
+    return None
+
+
+def choose_recovery_action(action: str, text: str, x: int, y: int, attempts: int, mcp_connected: bool) -> dict:
+    """Pick a different desktop-control method after repeated ineffective actions."""
+    cycle = max(0, attempts - 1) % 5
+    if action in ("click", "focus_window"):
+        fallbacks = [
+            {"action": "double", "x_pixel": x, "y_pixel": y, "text": "recovery double click"},
+            {"action": "press", "text": "enter"},
+            {"action": "right", "x_pixel": x, "y_pixel": y, "text": "recovery context click"},
+            {"action": "alt_tab", "text": "recovery alt tab"},
+            {"action": "screenshot", "text": "recovery observe"},
+        ]
+    elif action in ("scroll", "page_down", "page_up"):
+        fallbacks = [
+            {"action": "page_down", "text": "recovery page down"},
+            {"action": "read_page" if mcp_connected else "zoom_out", "text": "recovery collect or zoom"},
+            {"action": "multi_scroll", "x_pixel": x, "y_pixel": y, "text": "down:5"},
+            {"action": "page_up", "text": "recovery page up"},
+            {"action": "screenshot", "text": "recovery observe"},
+        ]
+    elif action in ("fill", "type"):
+        fallbacks = [
+            {"action": "hotkey", "text": "ctrl+a"},
+            {"action": "type", "text": text},
+            {"action": "press", "text": "enter"},
+            {"action": "click", "x_pixel": x, "y_pixel": y, "text": "recovery refocus"},
+            {"action": "screenshot", "text": "recovery observe"},
+        ]
+    else:
+        fallbacks = [
+            {"action": "wait", "text": "1"},
+            {"action": "screenshot", "text": "recovery observe"},
+            {"action": "alt_tab", "text": "recovery alt tab"},
+            {"action": "maximize", "text": "recovery maximize"},
+            {"action": "observe_browser" if mcp_connected else "activate_browser", "text": "recovery observe browser"},
+        ]
+    return fallbacks[cycle]
+
+
+class LoopController:
+    """Engineering controller around the ReAct decision core."""
+
+    def __init__(self, max_recoveries: int = 5):
+        self.max_recoveries = max_recoveries
+        self.last_action_key = ""
+        self.same_action_count = 0
+        self.recovery_attempts = 0
+        self.forced_failure = ""
+        self.last_image_fp = None
+        self.unchanged_screen_count = 0
+
+    def observe_image(self, image: Image.Image):
+        current_fp = _image_fingerprint(image)
+        if self.last_image_fp is not None and _fingerprint_distance(current_fp, self.last_image_fp) < 80:
+            self.unchanged_screen_count += 1
+        else:
+            self.unchanged_screen_count = 0
+        self.last_image_fp = current_fp
+
+    def maybe_recover(self, action: str, text: str, x: int, y: int,
+                      x2: int, y2: int, mcp_connected: bool) -> tuple:
+        predicted_action_key = f"{action}:{text}:{x}:{y}"
+        if predicted_action_key == self.last_action_key:
+            self.same_action_count += 1
+        else:
+            self.same_action_count = 0
+
+        if self.same_action_count < 1 and self.unchanged_screen_count < 2:
+            return action, text, x, y, x2, y2, ""
+
+        self.recovery_attempts += 1
+        if self.recovery_attempts > self.max_recoveries:
+            self.forced_failure = (
+                f"连续多次操作无效，已尝试 {self.max_recoveries} 种替代方法仍未完成；"
+                "请重新输入更明确的指令。"
+            )
+            return action, text, x, y, x2, y2, self.forced_failure
+
+        recovery = choose_recovery_action(action, text, x, y, self.recovery_attempts, mcp_connected)
+        old_action = action
+        action = recovery.get("action", action)
+        text = recovery.get("text", text)
+        x = recovery.get("x_pixel", x)
+        y = recovery.get("y_pixel", y)
+        x2 = recovery.get("x2_pixel", x2)
+        y2 = recovery.get("y2_pixel", y2)
+        self.unchanged_screen_count = 0
+        note = f"检测到连续重复或画面未变化，自动从 {old_action} 切换为 {action}（第 {self.recovery_attempts}/{self.max_recoveries} 种方法）"
+        return action, text, x, y, x2, y2, note
+
+    def record_action(self, action: str, text: str, x: int, y: int):
+        self.last_action_key = f"{action}:{text}:{x}:{y}"
 
 
 # ============================================================
@@ -976,7 +1265,7 @@ def audit_result(task: str, image: Image.Image,
 
 
 # ============================================================
-# Main Pipeline — ReAct Loop
+# Main Pipeline — Loop Engineer around ReAct Core
 # ============================================================
 
 MAX_REACT_ITERATIONS = 15
@@ -990,18 +1279,29 @@ def run_gui_task(task: str,
                  progress_callback: Callable = None,
                  hide_window: Callable = None,
                  show_window: Callable = None,
-                 shared_mcp: Optional[BrowserMCP] = None) -> dict:
-    """ReAct RPA pipeline — 所有任务统一走 ReAct 循环, AI 自己决定用什么工具."""
+                 shared_mcp: Optional[BrowserMCP] = None,
+                 user_id: str = "default",
+                 memory_key: str = "desktop") -> dict:
+    """Run GUI automation as ReAct core decision + Loop Engineer control."""
     import pyautogui
 
     mcp = shared_mcp or BrowserMCP(keep_browser_open=keep_browser_open)  # 延迟连接: AI 调用 open_url 时才 connect()
 
     browser_mode = bool(use_browser and is_browser_task(task))
+    operation_context = ""
+    try:
+        from utils.gui_operation_memory import build_operation_context
 
-    # --- ReAct Loop ---
+        operation_context = build_operation_context(user_id, memory_key, task)
+        if operation_context and progress_callback:
+            progress_callback("已加载当前操作窗口历史流程")
+    except Exception as exc:
+        print(f"[GuiOpMemory] load skipped: {exc}")
+
+    # --- Loop Engineer: observe -> ReAct decide -> execute -> recover ---
     history = []
-    last_action_key = ""
-    same_action_count = 0
+    collected_notes = []
+    loop = LoopController(max_recoveries=5)
     start_time = time.time()
 
     for iteration in range(MAX_REACT_ITERATIONS):
@@ -1026,19 +1326,17 @@ def run_gui_task(task: str,
             time.sleep(0.2)
 
         img = None
-        if browser_mode:
-            if not mcp.connected:
-                mcp.connect()
-            if mcp.connected:
-                img = mcp.screenshot_page()
+        if browser_mode and mcp.connected:
+            img = safe_browser_screenshot(mcp, progress_callback, history)
         if img is None:
             img = _screenshot_desktop()
+        loop.observe_image(img)
 
         if show_window:
             show_window()
 
         # ReAct decision
-        decision = react_decide(task, img, history)
+        decision = react_decide(task, img, history, operation_context=operation_context)
 
         if decision.get("done"):
             if progress_callback:
@@ -1054,6 +1352,25 @@ def run_gui_task(task: str,
         x2 = decision.get("x2_pixel", 0)
         y2 = decision.get("y2_pixel", 0)
 
+        action, text, x, y, x2, y2, loop_note = loop.maybe_recover(
+            action, text, x, y, x2, y2, bool(mcp and mcp.connected)
+        )
+        if loop.forced_failure:
+            print(f"[LoopController] {loop.forced_failure}")
+            break
+        if loop_note:
+            thought = f"{thought}；{loop_note}"
+
+        recent_actions = [h.split(" → ")[-1].split(" ", 1)[0] for h in history[-2:]]
+        if action == "scroll" and recent_actions == ["scroll", "scroll"]:
+            if mcp and mcp.connected:
+                action = "read_page"
+                text = "auto read_page after repeated scrolling"
+            else:
+                action = "zoom_out"
+                text = "auto zoom_out after repeated scrolling"
+            thought = f"{thought}；连续滚动后自动切换为 {action}，避免只滚动不收集信息"
+
         if progress_callback:
             progress_callback(f"  💭 {thought[:100]}")
             if action == "click":
@@ -1062,6 +1379,12 @@ def run_gui_task(task: str,
                 progress_callback(f"  ⌨️ {action}: \"{text[:50]}\"")
             elif action == "press":
                 progress_callback(f"  🔤 {action}: \"{text}\"")
+            elif action in ("page_down", "page_up", "page_jump", "multi_scroll", "screenshot", "alt_tab", "focus_window", "maximize", "zoom_in", "zoom_out"):
+                progress_callback(f"  🧭 {action}: {text}")
+            elif action in ("observe_browser", "activate_browser"):
+                progress_callback(f"  🌐 {action}")
+            elif action == "read_page":
+                progress_callback("  📄 read_page")
             else:
                 progress_callback(f"  ⏳ {action}: {text}")
 
@@ -1093,11 +1416,69 @@ def run_gui_task(task: str,
                     continue
                 _pyautogui_press(text)
             elif action == "scroll":
-                _pyautogui_scroll(text or "down")
+                _pyautogui_scroll(text or "down", x, y)
+            elif action == "multi_scroll":
+                _pyautogui_multi_scroll(text or "down:5", x, y)
+                text = f"multi_scroll {text or 'down:5'}"
+            elif action == "page_jump":
+                _pyautogui_page_jump(text or "1")
+                text = f"page_jump {text or '1'}"
+            elif action == "page_down":
+                _pyautogui_page("down")
+                text = "page down"
+            elif action == "page_up":
+                _pyautogui_page("up")
+                text = "page up"
             elif action == "wait":
                 time.sleep(min(float(text or 1), 5))
+            elif action == "screenshot":
+                time.sleep(0.5)
+                text = "screenshot refreshed"
+            elif action == "alt_tab":
+                _pyautogui_hotkey("alt+tab")
+                text = "alt tab"
+            elif action == "focus_window":
+                _pyautogui_click(x, y)
+                text = "window focused"
+            elif action == "observe_browser":
+                ok = observe_browser_page(mcp, progress_callback)
+                text = "browser observed" if ok else "no observable browser page"
+            elif action == "activate_browser":
+                ok = activate_browser_window(mcp, progress_callback)
+                text = "browser activation attempted" if ok else "browser activation failed"
+            elif action == "zoom_out":
+                _pyautogui_hotkey("ctrl+-")
+                text = "zoomed out"
+            elif action == "zoom_in":
+                import pyautogui
+                pyautogui.hotkey("ctrl", "+")
+                text = "zoomed in"
+            elif action == "maximize":
+                if mcp and mcp.connected:
+                    mcp.maximize()
+                else:
+                    _pyautogui_hotkey("win+up")
+                text = "window maximized"
+            elif action == "read_page":
+                if not mcp.connected:
+                    mcp.connect()
+                note = mcp.extract_page_text() if mcp.connected else ""
+                note = note[:5000]
+                if note:
+                    collected_notes.append(note)
+                    history.append(f"[read_page] {note[:1200]}")
+                    text = f"read {len(note)} chars"
+                else:
+                    text = "read_page failed or empty"
             elif action == "open_url":
-                _open_url_in_browser(text, mcp)
+                action_key = f"{action}:{text}:{x}:{y}"
+                if action_key == last_action_key:
+                    print(f"[ReAct] skip repeated open_url, wait for page focus/load: {text}")
+                    if mcp and mcp.connected:
+                        mcp.maximize()
+                    time.sleep(2)
+                else:
+                    _open_url_in_browser(text, mcp)
             else:
                 print(f"[ReAct] 未知动作: {action}")
         except Exception as e:
@@ -1107,23 +1488,31 @@ def run_gui_task(task: str,
         action_desc = f"{action}"
         if action == "click":
             action_desc += f" ({x},{y})"
-        elif action in ("type", "press", "scroll"):
+        elif action in ("type", "press", "scroll", "multi_scroll", "page_jump"):
             action_desc += f" \"{text}\""
         history.append(f"[{iteration+1}] {thought} → {action_desc}")
         time.sleep(1.5)
 
-        # Detect stuck loops
-        action_key = f"{action}:{text}:{x}:{y}"
-        if action_key == last_action_key:
-            same_action_count += 1
-            if same_action_count >= MAX_CONSECUTIVE_SAME_ACTION:
-                print(f"[ReAct] 连续{MAX_CONSECUTIVE_SAME_ACTION}次相同动作，退出循环")
-                break
-        else:
-            same_action_count = 0
-            last_action_key = action_key
+        # Update action fingerprint for the next ReAct step.
+        loop.record_action(action, text, x, y)
 
     elapsed = time.time() - start_time
+
+    if loop.forced_failure:
+        failure_audit = {"success": False, "reason": loop.forced_failure, "need_human": True}
+        try:
+            from utils.gui_operation_memory import update_operation_memory
+
+            update_operation_memory(user_id, memory_key, task, history, failure_audit)
+        except Exception as exc:
+            print(f"[GuiOpMemory] update skipped: {exc}")
+        return {
+            "success": False,
+            "message": loop.forced_failure,
+            "steps_done": f"{len(history)}/{iteration+1}",
+            "need_human": True,
+            "elapsed": f"{elapsed:.1f}s",
+        }
 
     # --- Final Audit ---
     if progress_callback:
@@ -1131,7 +1520,7 @@ def run_gui_task(task: str,
     try:
         img = _screenshot_desktop()
         if mcp and mcp.connected:
-            page_img = mcp.screenshot_page()
+            page_img = safe_browser_screenshot(mcp, progress_callback, history)
             if page_img:
                 img = page_img
         audit = audit_result(task, img)
@@ -1140,12 +1529,24 @@ def run_gui_task(task: str,
                  "reason": f"已执行 {len(history)} 个动作；审计截图失败: {e}",
                  "need_human": False}
 
+    try:
+        from utils.gui_operation_memory import update_operation_memory
+
+        update_operation_memory(user_id, memory_key, task, history, audit)
+    except Exception as exc:
+        print(f"[GuiOpMemory] update skipped: {exc}")
+
     # 任务完成后不关闭浏览器，保留页面供用户查看
     # ESC 取消时才关闭 (见上方 cancel_file 检查)
 
+    message = audit.get("reason", "")
+    if collected_notes:
+        notes = "\n\n---\n\n".join(collected_notes[-3:])
+        message = f"{message}\n\n已读取网页资料：\n{notes[:8000]}".strip()
+
     return {
         "success": audit.get("success", False),
-        "message": audit.get("reason", ""),
+        "message": message,
         "steps_done": f"{len(history)}/{iteration+1}",
         "need_human": audit.get("need_human", False),
         "elapsed": f"{elapsed:.1f}s",

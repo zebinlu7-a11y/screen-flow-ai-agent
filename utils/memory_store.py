@@ -242,3 +242,121 @@ def build_memory_context(user_id: str, query: str = "") -> str:
         lines.append(f"- {f.get('content', '')}")
 
     return "\n".join(lines)
+
+
+# ============================================================
+# Clean retrieval overrides
+# ============================================================
+
+_STOP_WORDS = {
+    "的", "了", "呢", "吗", "啊", "是", "我", "你", "他", "她", "它", "我们", "你们",
+    "这个", "那个", "什么", "怎么", "为什么", "可以", "不能", "有没有", "一下",
+}
+
+
+def _tokenize_query(text: str) -> List[str]:
+    """Extract lightweight Chinese/English keywords for fallback retrieval."""
+    if not text:
+        return []
+
+    tokens = re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", text.lower())
+    result = []
+    seen = set()
+    for token in tokens:
+        if token in _STOP_WORDS or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result
+
+
+def _fact_text(fact: dict) -> str:
+    return str(fact.get("content", "")).strip()
+
+
+def search_facts(query: str, facts: List[dict], top_k: int = 5) -> List[dict]:
+    """
+    Hybrid long-term memory retrieval.
+
+    1. Try vector retrieval.
+    2. Add keyword matches as a robust fallback.
+    3. Deduplicate and keep the best/top recent facts.
+    """
+    if not facts:
+        return []
+    if not query or not query.strip():
+        return list(facts[-min(top_k, len(facts)):])
+
+    bm25_results = []
+
+    try:
+        from utils.vector_store import get_memory_vector_store
+
+        store = get_memory_vector_store()
+        results = store.search(query, top_k=max(top_k * 2, 8))
+        text_to_fact = {_fact_text(f): f for f in facts if _fact_text(f)}
+        for _, text, score in results:
+            fact = text_to_fact.get(text.strip())
+            if fact:
+                key = fact.get("id") or _fact_text(fact)
+                bm25_results.append((key, _fact_text(fact), float(score)))
+    except Exception as e:
+        print(f"[Memory] BM25 search failed, using keyword fallback: {e}")
+
+    dense_results = []
+    try:
+        from utils.vector_store import get_memory_vector_store
+
+        store = get_memory_vector_store()
+        results = store.search_dense(query, top_k=max(top_k * 2, 8))
+        text_to_fact = {_fact_text(f): f for f in facts if _fact_text(f)}
+        for _, text, score in results:
+            fact = text_to_fact.get(text.strip())
+            if fact:
+                key = fact.get("id") or _fact_text(fact)
+                dense_results.append((key, _fact_text(fact), float(score)))
+    except Exception as e:
+        print(f"[Memory] dense search failed, using sparse branches: {e}")
+
+    keyword_results = []
+    keywords = _tokenize_query(query)
+    if keywords:
+        for fact in facts:
+            content = _fact_text(fact).lower()
+            if not content:
+                continue
+            score = sum(1 for kw in keywords if kw in content)
+            if score > 0:
+                key = fact.get("id") or _fact_text(fact)
+                keyword_results.append((key, _fact_text(fact), float(score)))
+
+    if not bm25_results and not dense_results and not keyword_results:
+        return list(facts[-min(3, len(facts)):])
+
+    from utils.retrieval_ranker import rerank, rrf_fuse
+
+    fused = rrf_fuse([bm25_results, dense_results, keyword_results])
+    reranked = rerank(query, fused, top_k=top_k)
+    fact_by_key = {fact.get("id") or _fact_text(fact): fact for fact in facts}
+    return [fact_by_key[key] for key, _, _ in reranked if key in fact_by_key]
+
+
+def build_memory_context(user_id: str, query: str = "") -> str:
+    """Build source-labeled long-term memory context for the system prompt."""
+    profile = load_profile(user_id)
+    facts = profile.get("facts", []) or []
+    if not facts:
+        return ""
+
+    relevant = search_facts(query, facts, top_k=5)
+    if not relevant:
+        return ""
+
+    lines = ["\n\n## 长期记忆：当前用户相关事实"]
+    for fact in relevant:
+        fact_type = fact.get("type", "fact")
+        content = _fact_text(fact)
+        if content:
+            lines.append(f"- [{fact_type}] {content}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""

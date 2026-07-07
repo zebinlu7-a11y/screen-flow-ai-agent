@@ -39,7 +39,7 @@ from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from config import (
     DEFAULT_HOTKEY, TOGGLE_HOTKEY, OCR_HOTKEY, LEETCODE_HOTKEY, QUIT_HOTKEY,
     CONTEXT_FILE, HTTP_PROXY, RECENT_ROUNDS,
-    FULLSCREEN_CAPTURE_PROMPT,
+    FULLSCREEN_CAPTURE_PROMPT, CURSOR_STEP,
 )
 from utils.image_tool import qimage_to_pil, pil_to_base64, compress_image
 from utils.context_store import load_context, save_context
@@ -689,6 +689,11 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+k': self._on_leetcode_hotkey,
                 '<ctrl>+y': self._on_speech_hotkey,
                 '<ctrl>+g': self._on_gui_agent_hotkey,
+                # 鼠标微调
+                '<ctrl>+<up>': lambda: self._cursor_move(0, -CURSOR_STEP),
+                '<ctrl>+<down>': lambda: self._cursor_move(0, CURSOR_STEP),
+                '<ctrl>+<left>': lambda: self._cursor_move(-CURSOR_STEP, 0),
+                '<ctrl>+<right>': lambda: self._cursor_move(CURSOR_STEP, 0),
                 '<ctrl>+q': self._on_quit_hotkey,
                 '<esc>': self._on_esc_hotkey,
             }
@@ -701,6 +706,7 @@ class ScreenAIAgent(QObject):
             print(f"         Ctrl+R — OCR 文字识别")
             print(f"         Ctrl+K — LeetCode 编程解答")
             print(f"         Ctrl+F — 隐藏/显示窗口")
+            print(f"         Ctrl+↑↓←→ — 鼠标微调 ({CURSOR_STEP}px)")
             print(f"         Ctrl+Q — 退出程序")
         except Exception as e:
             self._hotkey_registered = False
@@ -732,6 +738,11 @@ class ScreenAIAgent(QObject):
         else:
             self._result_window.show()
             self._result_window.raise_()
+
+    def _cursor_move(self, dx: int, dy: int):
+        """Ctrl+方向键 — 微调鼠标位置（后台线程调用，用 QTimer 切主线程）。"""
+        from PyQt6.QtGui import QCursor
+        QTimer.singleShot(0, lambda: QCursor.setPos(QCursor.pos() + QPoint(dx, dy)))
 
     def _on_ocr_hotkey(self, key=None):
         """Ctrl+R 回调 — 启动 OCR 截图模式。"""

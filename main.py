@@ -740,9 +740,11 @@ class ScreenAIAgent(QObject):
             self._result_window.raise_()
 
     def _cursor_move(self, dx: int, dy: int):
-        """Ctrl+方向键 — 微调鼠标位置（后台线程调用，用 QTimer 切主线程）。"""
-        from PyQt6.QtGui import QCursor
-        QTimer.singleShot(0, lambda: QCursor.setPos(QCursor.pos() + QPoint(dx, dy)))
+        """Ctrl+方向键 — 微调鼠标位置（Windows API，任何线程可用）。"""
+        import ctypes
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        ctypes.windll.user32.SetCursorPos(pt.x + dx, pt.y + dy)
 
     def _on_ocr_hotkey(self, key=None):
         """Ctrl+R 回调 — 启动 OCR 截图模式。"""

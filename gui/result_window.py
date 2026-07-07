@@ -265,10 +265,10 @@ class ResultWindow(QWidget):
         self._text_view = QTextEdit()
         self._text_view.setReadOnly(True)
         self._text_view.setTextInteractionFlags(
-            Qt.TextInteractionFlag.NoTextInteraction
+            Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self._text_view.setFont(QFont("Microsoft YaHei", RESULT_FONT_SIZE))
-        self._text_view.setCursor(Qt.CursorShape.ArrowCursor)
+        self._text_view.setCursor(Qt.CursorShape.IBeamCursor)
         self._text_view.setStyleSheet("""
             QTextEdit {
                 background-color: transparent;
@@ -312,8 +312,10 @@ class ResultWindow(QWidget):
         self._speech_text.setReadOnly(True)
         self._speech_text.setFixedHeight(80)
         self._speech_text.setFont(QFont("Microsoft YaHei", 11))
-        self._speech_text.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self._speech_text.setCursor(Qt.CursorShape.ArrowCursor)
+        self._speech_text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._speech_text.setCursor(Qt.CursorShape.IBeamCursor)
         self._speech_text.setStyleSheet("""
             QTextEdit {
                 background: #e8f0e8; color: #334433; border: 1px solid #b0c8b0;
@@ -1006,6 +1008,14 @@ class ResultWindow(QWidget):
         }
         return QCursor(cursors.get(edge, Qt.CursorShape.ArrowCursor))
 
+    def _is_title_bar(self, pos: QPoint) -> bool:
+        """判断点击位置是否在标题栏区域（顶部 36px 内且不在按钮上）。"""
+        y = pos.y()
+        if y < 0 or y > 36:
+            return False
+        # 左侧侧边栏切换按钮 + 标题区域可拖，右侧按钮区域交给按钮自己处理
+        return True
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() != Qt.MouseButton.LeftButton:
             return
@@ -1020,27 +1030,26 @@ class ResultWindow(QWidget):
             self._resize_start_geo = self.geometry()
             self._resize_start_pos = event.globalPosition().toPoint()
             event.accept()
-        else:
-            # 开始拖动
+        elif self._is_title_bar(pos):
+            # 仅在标题栏区域拖动窗口
             self._dragging = True
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
+        # 内容区点击不处理，交给子控件（文本选择等）
 
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position().toPoint()
         gpos = event.globalPosition().toPoint()
 
         if self._resizing:
-            # 缩放窗口
             self._do_resize(gpos)
             event.accept()
         elif self._dragging:
-            # 拖动窗口
             new_pos = gpos - self._drag_pos
             self.move(new_pos)
             event.accept()
         else:
-            # 仅移动鼠标 — 更新光标提示
+            # 仅移动鼠标 — 更新光标提示（边缘显示调整箭头，否则默认箭头）
             edge = self._get_resize_edge(pos)
             if edge:
                 self.setCursor(self._cursor_for_edge(edge))

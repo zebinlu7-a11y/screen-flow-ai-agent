@@ -1,4 +1,4 @@
-﻿"""
+"""
 AIRAG — 智能截图解析悬浮窗工具 主入口
 
 流程：
@@ -447,6 +447,14 @@ class ScreenAIAgent(QObject):
         self._thread_id = "default"
         self._hotkey_registered = False
 
+        # Ctrl+方向键 窗口移动
+        self._move_dir = ""
+        self._move_pressed: set = set()
+        self._move_timer = QTimer(self)
+        self._move_timer.timeout.connect(self._on_move_tick)
+        self._move_timer.setInterval(40)  # 25fps
+        self._key_listener = None
+
         # 用户系统
         self._user_id = user_id_from_key(get_api_key())
         self._active_conv_id = get_active_conversation_id()
@@ -671,6 +679,11 @@ class ScreenAIAgent(QObject):
                 self._hotkey_listener.stop()
         except Exception:
             pass
+        try:
+            if hasattr(self, '_key_listener') and self._key_listener:
+                self._key_listener.stop()
+        except Exception:
+            pass
         self._tray.hide()
         self._app.quit()
 
@@ -689,11 +702,6 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+k': self._on_leetcode_hotkey,
                 '<ctrl>+y': self._on_speech_hotkey,
                 '<ctrl>+g': self._on_gui_agent_hotkey,
-                # 鼠标微调
-                '<ctrl>+<up>': lambda: self._cursor_move(0, -CURSOR_STEP),
-                '<ctrl>+<down>': lambda: self._cursor_move(0, CURSOR_STEP),
-                '<ctrl>+<left>': lambda: self._cursor_move(-CURSOR_STEP, 0),
-                '<ctrl>+<right>': lambda: self._cursor_move(CURSOR_STEP, 0),
                 '<ctrl>+q': self._on_quit_hotkey,
                 '<esc>': self._on_esc_hotkey,
             }
@@ -706,8 +714,17 @@ class ScreenAIAgent(QObject):
             print(f"         Ctrl+R — OCR 文字识别")
             print(f"         Ctrl+K — LeetCode 编程解答")
             print(f"         Ctrl+F — 隐藏/显示窗口")
-            print(f"         Ctrl+↑↓←→ — 鼠标微调 ({CURSOR_STEP}px)")
+            print(f"         Ctrl+↑↓←→ — 移动悬浮窗 ({CURSOR_STEP}px/步)")
             print(f"         Ctrl+Q — 退出程序")
+
+            # Ctrl+方向键用原始按键监听（GlobalHotKeys 不支持组合方向键）
+            try:
+                self._key_listener = pynput_keyboard.Listener(
+                    on_press=self._on_key_press,
+                    on_release=self._on_key_release)
+                self._key_listener.start()
+            except Exception:
+                self._key_listener = None
         except Exception as e:
             self._hotkey_registered = False
             self._hotkey_listener = None
@@ -740,11 +757,76 @@ class ScreenAIAgent(QObject):
             self._result_window.raise_()
 
     def _cursor_move(self, dx: int, dy: int):
-        """Ctrl+方向键 — 微调鼠标位置（Windows API，任何线程可用）。"""
-        import ctypes
-        pt = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        ctypes.windll.user32.SetCursorPos(pt.x + dx, pt.y + dy)
+        """Ctrl+方向键 — 移动悬浮窗（切回主线程操作 Qt 窗口）。"""
+        QTimer.singleShot(0, lambda: self._move_window(dx, dy))
+
+    def _move_window(self, dx: int, dy: int):
+        """主线程移动悬浮窗。"""
+        if self._result_window and self._result_window.isVisible():
+            geo = self._result_window.geometry()
+            self._result_window.move(geo.x() + dx, geo.y() + dy)
+
+    # ============================================================
+    # Ctrl+方向键 原始按键监听（支持按住不放持续移动）
+    # ============================================================
+
+    def _on_key_press(self, key):
+        """pynput 原始按键按下 — 后台线程"""
+        try:
+            name = getattr(key, 'name', None)
+            if name is None:
+                return
+            if name in ('ctrl', 'ctrl_l', 'ctrl_r', 'up', 'down', 'left', 'right'):
+                self._move_pressed.add(name)
+                self._update_arrow_move()
+        except Exception:
+            pass
+
+    def _on_key_release(self, key):
+        """pynput 原始按键释放 — 后台线程"""
+        try:
+            name = getattr(key, 'name', None)
+            if name is None:
+                return
+            self._move_pressed.discard(name)
+            self._update_arrow_move()
+        except Exception:
+            pass
+
+    def _update_arrow_move(self):
+        """根据当前按下的键确定方向，控制移动定时器启停"""
+        has_ctrl = bool({'ctrl', 'ctrl_l', 'ctrl_r'} & self._move_pressed)
+        old = self._move_dir
+        if has_ctrl:
+            if 'up' in self._move_pressed:
+                self._move_dir = 'up'
+            elif 'down' in self._move_pressed:
+                self._move_dir = 'down'
+            elif 'left' in self._move_pressed:
+                self._move_dir = 'left'
+            elif 'right' in self._move_pressed:
+                self._move_dir = 'right'
+            else:
+                self._move_dir = ''
+        else:
+            self._move_dir = ''
+        # 方向变化时启停定时器
+        if self._move_dir and not old:
+            QTimer.singleShot(0, self._move_timer.start)
+        elif not self._move_dir and old:
+            QTimer.singleShot(0, self._move_timer.stop)
+
+    def _on_move_tick(self):
+        """QTimer 回调 — 主线程，每帧移动悬浮窗"""
+        if not self._move_dir or not self._result_window:
+            return
+        x, y = self._result_window.x(), self._result_window.y()
+        s = CURSOR_STEP
+        if self._move_dir == 'up':       y -= s
+        elif self._move_dir == 'down':   y += s
+        elif self._move_dir == 'left':   x -= s
+        elif self._move_dir == 'right':  x += s
+        self._result_window.move(x, y)
 
     def _on_ocr_hotkey(self, key=None):
         """Ctrl+R 回调 — 启动 OCR 截图模式。"""
@@ -831,6 +913,7 @@ class ScreenAIAgent(QObject):
         user_text = FULLSCREEN_CAPTURE_PROMPT
         self._last_user_text = user_text
         self._last_image_b64_list = [image_base64]
+        self._last_capture_rect = None  # 不强制重新定位，保持原位
 
         self._result_window.show()
         self._result_window.raise_()
@@ -893,11 +976,9 @@ class ScreenAIAgent(QObject):
 
         has_image = len(image_base64_list) > 0
 
-        # 只有新截图时才重新定位窗口
+        # 只有框选截图时（有选区）才定位窗口到截图旁边，否则保持原位
         if has_image and self._last_capture_rect and not self._last_capture_rect.isEmpty():
             self._result_window.position_near_rect(self._last_capture_rect)
-        elif has_image:
-            self._result_window._position_bottom_right()
 
         # 在已有内容后追加用户问题标题
         if user_text.strip():
@@ -1612,6 +1693,11 @@ def main():
         try:
             if hasattr(agent, '_hotkey_listener') and agent._hotkey_listener:
                 agent._hotkey_listener.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, '_key_listener') and agent._key_listener:
+                agent._key_listener.stop()
         except Exception:
             pass
         print("[AIRAG] 已退出。")

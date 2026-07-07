@@ -1,11 +1,4 @@
-"""
-LangGraph core state machine and streaming entry point.
-
-Memory retrieval is organized as three layers:
-1. Short-term memory: the most recent complete turns.
-2. Mid-term memory: semantically relevant older conversation snippets.
-3. Long-term memory: persistent user facts from profile/vector storage.
-"""
+﻿# -*- coding: utf-8 -*-
 import hashlib
 import time
 from dataclasses import dataclass
@@ -23,12 +16,13 @@ from utils.retrieval_ranker import lexical_score, rerank, rrf_fuse
 
 
 BASE_SYSTEM_PROMPT = (
-    "你是一个实用的桌面 AI 助手。用户可能发送文字、截图或两者结合。"
-    "请仔细分析所有输入内容，给出准确、完整、有操作性的回答。"
-    "如果是代码问题，请解释原理并给出可执行的修改建议；"
-    "如果是图表或数据，请解读趋势和关键信息；"
-    "如果是报错信息，请分析原因并提供具体解决步骤。"
-    "回答风格：专业但不啰嗦，结构清晰，善用 Markdown。"
+    "你是一名专业编程老师。"
+    "请根据用户提供的截图内容或问题，优先给出可直接使用的回答。"
+    "如果是编程题，请按 LeetCode 风格组织答案：先给思路，再给代码，再给复杂度。"
+    "代码必须添加清晰中文注释，解释关键步骤和变量含义，便于学习理解。"
+    "如果截图里有题目、报错、界面状态或代码片段，请结合截图逐项分析，不要只做泛泛总结。"
+    "如果信息不足，请明确说明缺少哪些关键信息，并给出下一步要怎么补充。"
+    "回答风格：专业、简洁、结构清楚，优先 Markdown。"
 )
 
 MID_TERM_TOP_K = 4
@@ -77,10 +71,10 @@ def _message_text(message: BaseMessage) -> str:
 
 def _message_role(message: BaseMessage) -> str:
     if isinstance(message, HumanMessage):
-        return "用户"
+        return "鐢ㄦ埛"
     if isinstance(message, AIMessage):
         return "AI"
-    return "系统"
+    return "绯荤粺"
 
 
 def index_conversation_messages(messages: List[BaseMessage], conversation_id: str = "default") -> None:

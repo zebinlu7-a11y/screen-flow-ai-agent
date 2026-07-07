@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Lightweight retrieval fusion and reranking helpers."""
 import math
 import re

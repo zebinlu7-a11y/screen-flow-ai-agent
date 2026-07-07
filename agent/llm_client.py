@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Doubao VL LangChain ChatModel wrapper using the OpenAI-compatible API.
 

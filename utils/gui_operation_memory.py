@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Persistent operation memory for GUI/ReAct automation.
 

@@ -48,7 +48,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 **手机远程控制** — 手机浏览器扫码，实时看 PC 屏幕 + 发送指令。
 
-<img src="assets/user5.png" alt="手机远程控制" width="280">
+<img src="assets/user5.png" alt="手机远程控制" width="220">
 
 ## 快捷键
 
@@ -142,7 +142,7 @@ ReAct Loop (最多 15 步):
 
 手机浏览器扫码或输入 URL，实时查看 PC 屏幕、发送指令、控制 PC 执行任务。
 
-<img src="assets/user5.png" alt="手机远程控制" width="280">
+<img src="assets/user5.png" alt="手机远程控制" width="220">
 
 ### 连接方式
 

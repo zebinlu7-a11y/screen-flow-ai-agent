@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 透明悬浮结果窗 — 流式显示 AI 回复，支持 Markdown、拖动、缩放。
 
@@ -8,6 +9,7 @@
   - 呼吸灯加载动画（等待 AI 回复时）
   - 右键菜单：清空/复制/关闭
 """
+import os
 import re
 from PyQt6.QtCore import Qt, QPoint, QSize, QRect, QTimer, pyqtSignal
 from gui.sidebar_widget import SidebarWidget
@@ -23,6 +25,7 @@ from PyQt6.QtWidgets import (
 from config import (
     RESULT_WINDOW_WIDTH, RESULT_WINDOW_HEIGHT,
     RESULT_WINDOW_OPACITY, RESULT_FONT_SIZE,
+    RESULT_INITIAL_POS,
 )
 
 # 边缘检测距离（像素）
@@ -64,6 +67,7 @@ class ResultWindow(QWidget):
         self._loading_timer = QTimer(self)
         self._loading_timer.timeout.connect(self._tick_loading)
         self._loading_base_text = ""
+        self._interactive_regions = []
 
         self._setup_ui()
 
@@ -148,16 +152,21 @@ class ResultWindow(QWidget):
         self._win_hidden_done = False
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
         self.resize(RESULT_WINDOW_WIDTH + 220, RESULT_WINDOW_HEIGHT)  # 给侧边栏留空间
-        self._position_bottom_right()
+        # 初始位置：用配置固定位置，否则默认右下角
+        if RESULT_INITIAL_POS and len(RESULT_INITIAL_POS) == 2:
+            self.move(RESULT_INITIAL_POS[0], RESULT_INITIAL_POS[1])
+        else:
+            self._position_bottom_right()
 
-        # 深色半透明背景
+        # 浅色半透明背景
         palette = self.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 35, 235))
+        palette.setColor(QPalette.ColorRole.Window, QColor(248, 248, 250, 224))
         self.setPalette(palette)
         self.setAutoFillBackground(True)
 
         # 启用鼠标追踪（边缘检测需要）
         self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         # 主布局（水平：侧边栏 + 右侧内容）
         self._main_h_layout = QHBoxLayout(self)
@@ -177,7 +186,7 @@ class ResultWindow(QWidget):
         # 分隔线（跟随侧边栏显隐）
         self._sidebar_sep = QWidget()
         self._sidebar_sep.setFixedWidth(1)
-        self._sidebar_sep.setStyleSheet("background: #3a3a45;")
+        self._sidebar_sep.setStyleSheet("background: #c8c8d0;")
         self._sidebar_sep.hide()
         self._main_h_layout.addWidget(self._sidebar_sep)
 
@@ -194,28 +203,30 @@ class ResultWindow(QWidget):
         # 侧边栏切换按钮
         self._sidebar_toggle_btn = QPushButton("☰")
         self._sidebar_toggle_btn.setFixedSize(26, 26)
+        self._sidebar_toggle_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._sidebar_toggle_btn.setToolTip("显示/隐藏对话历史")
         self._sidebar_toggle_btn.setStyleSheet("""
-            QPushButton { background: #3a3a40; color: #ccc; border: none;
+            QPushButton { background: #e0e0e5; color: #333; border: none;
                 border-radius: 4px; font-size: 14px; font-weight: bold; }
-            QPushButton:hover { background: #555; color: white; }
+            QPushButton:hover { background: #b0b0b8; color: white; }
         """)
         self._sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
         title_bar.addWidget(self._sidebar_toggle_btn)
 
         self._title_label = QLabel("Ai_Flow")
         self._title_label.setFont(QFont("Microsoft YaHei", 11))
-        self._title_label.setStyleSheet("color: #88aaff; font-weight: bold;")
+        self._title_label.setStyleSheet("color: #2255aa; font-weight: bold;")
         title_bar.addWidget(self._title_label)
         title_bar.addStretch()
 
         self._clear_btn = QPushButton("清空")
+        self._clear_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._clear_btn.setStyleSheet("""
             QPushButton {
-                background: #3a3a40; color: #ccc; border: none;
+                background: #e0e0e5; color: #333; border: none;
                 border-radius: 4px; padding: 3px 10px; font-size: 11px;
             }
-            QPushButton:hover { background: #555; }
+            QPushButton:hover { background: #b0b0b8; }
         """)
         self._clear_btn.clicked.connect(self.clear_content)
         title_bar.addWidget(self._clear_btn)
@@ -223,25 +234,27 @@ class ResultWindow(QWidget):
         # 推后台按钮
         min_btn = QPushButton("—")
         min_btn.setFixedSize(24, 24)
+        min_btn.setCursor(Qt.CursorShape.ArrowCursor)
         min_btn.setToolTip("隐藏到后台（Ctrl+D 可重新截图）")
         min_btn.setStyleSheet("""
             QPushButton {
-                background: #3a3a40; color: #ccc; border: none;
+                background: #e0e0e5; color: #333; border: none;
                 border-radius: 12px; font-size: 14px; font-weight: bold;
             }
-            QPushButton:hover { background: #555; color: white; }
+            QPushButton:hover { background: #b0b0b8; color: white; }
         """)
         min_btn.clicked.connect(self.hide)
         title_bar.addWidget(min_btn)
 
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.CursorShape.ArrowCursor)
         close_btn.setStyleSheet("""
             QPushButton {
-                background: #c0392b; color: white; border: none;
+                background: #cc4444; color: white; border: none;
                 border-radius: 12px; font-size: 13px; font-weight: bold;
             }
-            QPushButton:hover { background: #e74c3c; }
+            QPushButton:hover { background: #dd5555; }
         """)
         close_btn.clicked.connect(self.close)
         title_bar.addWidget(close_btn)
@@ -252,20 +265,18 @@ class ResultWindow(QWidget):
         self._text_view = QTextEdit()
         self._text_view.setReadOnly(True)
         self._text_view.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse |
-            Qt.TextInteractionFlag.TextSelectableByKeyboard
+            Qt.TextInteractionFlag.NoTextInteraction
         )
         self._text_view.setFont(QFont("Microsoft YaHei", RESULT_FONT_SIZE))
-        # 不显示 I 型光标
-        self._text_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self._text_view.setCursor(Qt.CursorShape.ArrowCursor)
         self._text_view.setStyleSheet("""
             QTextEdit {
                 background-color: transparent;
-                color: #e0e0e0;
-                border: 1px solid #3a3a45;
+                color: #1a1a1a;
+                border: 1px solid #c8c8d0;
                 border-radius: 6px;
                 padding: 8px;
-                selection-background-color: #3a5a8c;
+                selection-background-color: #aac0dd;
             }
         """)
         self._text_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -286,10 +297,11 @@ class ResultWindow(QWidget):
 
         self._speech_send_btn = QPushButton("📤 发送选中句")
         self._speech_send_btn.setFixedHeight(24)
+        self._speech_send_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._speech_send_btn.setStyleSheet("""
-            QPushButton { background: #2b5db8; color: white; border: none;
+            QPushButton { background: #3366cc; color: white; border: none;
                 border-radius: 4px; padding: 2px 10px; font-size: 10px; }
-            QPushButton:hover { background: #3a6fd8; }
+            QPushButton:hover { background: #4477dd; }
         """)
         self._speech_send_btn.clicked.connect(self._send_speech_selected)
         self._speech_send_btn.hide()
@@ -300,9 +312,11 @@ class ResultWindow(QWidget):
         self._speech_text.setReadOnly(True)
         self._speech_text.setFixedHeight(80)
         self._speech_text.setFont(QFont("Microsoft YaHei", 11))
+        self._speech_text.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self._speech_text.setCursor(Qt.CursorShape.ArrowCursor)
         self._speech_text.setStyleSheet("""
             QTextEdit {
-                background: #1a2a1a; color: #ccddcc; border: 1px solid #2a4a2a;
+                background: #e8f0e8; color: #334433; border: 1px solid #b0c8b0;
                 border-radius: 4px; padding: 4px 8px;
             }
         """)
@@ -319,9 +333,9 @@ class ResultWindow(QWidget):
         self._thumb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._thumb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._thumb_scroll.setStyleSheet("""
-            QScrollArea { background: transparent; border: 1px solid #3a3a45; border-radius: 4px; }
-            QScrollBar:horizontal { height: 5px; background: #2a2a30; border-radius: 2px; }
-            QScrollBar::handle:horizontal { background: #555; border-radius: 2px; }
+            QScrollArea { background: transparent; border: 1px solid #c8c8d0; border-radius: 4px; }
+            QScrollBar:horizontal { height: 5px; background: #d8d8dd; border-radius: 2px; }
+            QScrollBar::handle:horizontal { background: #b0b0b8; border-radius: 2px; }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         """)
         self._thumb_scroll.hide()
@@ -342,12 +356,13 @@ class ResultWindow(QWidget):
 
         self._copy_btn = QPushButton("📋复制")
         self._copy_btn.setFixedHeight(26)
+        self._copy_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._copy_btn.setStyleSheet("""
             QPushButton {
-                background: #2a5a3a; color: #aaddaa; border: 1px solid #3a6a4a;
+                background: #c8e0c8; color: #335533; border: 1px solid #a0c8a0;
                 border-radius: 4px; padding: 2px 14px; font-size: 10px;
             }
-            QPushButton:hover { background: #3a7a4a; color: #ccffcc; }
+            QPushButton:hover { background: #b0d8b0; color: #225522; }
         """)
         self._copy_btn.clicked.connect(self._copy_images_to_clipboard)
         self._copy_btn.hide()
@@ -361,55 +376,61 @@ class ResultWindow(QWidget):
 
         self._mode_combo = QComboBox()
         self._mode_combo.setFixedWidth(76)
+        self._mode_combo.setCursor(Qt.CursorShape.ArrowCursor)
         self._mode_combo.addItem("操作", "operate")
         self._mode_combo.addItem("问答", "chat")
         self._mode_combo.setCurrentIndex(0)
         self._mode_combo.setToolTip("切换输入模式")
         self._mode_combo.setStyleSheet("""
             QComboBox {
-                background: #26384a; color: #d7ecff; border: 1px solid #4d708f;
+                background: #d8e4f0; color: #1a3355; border: 1px solid #8899bb;
                 border-radius: 5px; padding: 4px 7px; font-size: 11px;
             }
-            QComboBox:hover { border-color: #6fa1ca; }
+            QComboBox:hover { border-color: #6688aa; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background: #2a2a35; color: #ddd; selection-background-color: #315c7c;
-                border: 1px solid #555;
+                background: #f0f0f3; color: #222; selection-background-color: #aac0dd;
+                border: 1px solid #b0b0b8;
             }
         """)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         ask_layout.addWidget(self._mode_combo)
+        self._mode_combo.installEventFilter(self)
 
         self._ask_input = QLineEdit()
         self._ask_input.setPlaceholderText("输入要操作的任务，Enter 执行...")
         self._ask_input.setFont(QFont("Microsoft YaHei", 11))
+        self._ask_input.setCursor(Qt.CursorShape.ArrowCursor)
         self._ask_input.setStyleSheet("""
             QLineEdit {
-                background-color: #2a2a35;
-                color: #e0e0e0;
-                border: 1px solid #4a4a55;
+                background-color: #f0f0f3;
+                color: #1a1a1a;
+                border: 1px solid #c0c0c8;
                 border-radius: 5px;
                 padding: 6px 10px;
             }
-            QLineEdit:focus { border-color: #4a8af4; }
+            QLineEdit:focus { border-color: #2255cc; }
         """)
         self._ask_input.returnPressed.connect(self._on_input_return)
+        self._ask_input.installEventFilter(self)
         ask_layout.addWidget(self._ask_input, stretch=1)
+        self._ask_input.installEventFilter(self)
 
         # ---- 模型选择器 ----
         from config import MODEL_OPTIONS, MODEL_OPTIONS_DEFAULT, DOUBAO_MODEL_NAME
         self._model_combo = QComboBox()
         self._model_combo.setFixedWidth(110)
+        self._model_combo.setCursor(Qt.CursorShape.ArrowCursor)
         self._model_combo.setStyleSheet("""
             QComboBox {
-                background: #2a2a35; color: #aaccff; border: 1px solid #4a4a55;
+                background: #f0f0f3; color: #2255aa; border: 1px solid #c0c0c8;
                 border-radius: 5px; padding: 4px 8px; font-size: 10px;
             }
-            QComboBox:hover { border-color: #6a8af4; }
+            QComboBox:hover { border-color: #2255cc; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background: #2a2a35; color: #ccc; selection-background-color: #3a5a8c;
-                border: 1px solid #555;
+                background: #f0f0f3; color: #333; selection-background-color: #aac0dd;
+                border: 1px solid #b0b0b8;
             }
         """)
         for label, model_id in MODEL_OPTIONS.items():
@@ -418,32 +439,39 @@ class ResultWindow(QWidget):
             if model_id == DOUBAO_MODEL_NAME:
                 self._model_combo.setCurrentIndex(self._model_combo.count() - 1)
         self._model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self._model_combo.installEventFilter(self)
         ask_layout.addWidget(self._model_combo)
+        self._model_combo.installEventFilter(self)
 
         # 设置按钮
         settings_btn = QPushButton("⚙")
         settings_btn.setFixedWidth(30)
+        settings_btn.setCursor(Qt.CursorShape.ArrowCursor)
         settings_btn.setToolTip("设置 API Key / OCR 凭证")
         settings_btn.setStyleSheet("""
             QPushButton {
-                background: #3a3a40; color: #aaa; border: 1px solid #555;
+                background: #e0e0e5; color: #555; border: 1px solid #b0b0b8;
                 border-radius: 5px; padding: 4px 0; font-size: 14px;
             }
-            QPushButton:hover { background: #555; color: #fff; }
+            QPushButton:hover { background: #b0b0b8; color: #fff; }
         """)
         settings_btn.clicked.connect(self._open_settings)
+        settings_btn.installEventFilter(self)
         ask_layout.addWidget(settings_btn)
+        settings_btn.installEventFilter(self)
 
         send_btn = QPushButton("发送")
         send_btn.setStyleSheet("""
             QPushButton {
-                background: #2b5db8; color: white; border: none;
+                background: #3366cc; color: white; border: none;
                 border-radius: 5px; padding: 6px 14px; font-size: 11px; font-weight: bold;
             }
-            QPushButton:hover { background: #3a6fd8; }
+            QPushButton:hover { background: #4477dd; }
         """)
         send_btn.clicked.connect(self._send_follow_up)
+        send_btn.installEventFilter(self)
         ask_layout.addWidget(send_btn)
+        send_btn.installEventFilter(self)
 
         layout.addLayout(ask_layout)
 
@@ -523,8 +551,8 @@ class ResultWindow(QWidget):
         pulse = ["○", "◔", "◑", "◕"][self._loading_dots]
         loading_html = (
             f"<div style='text-align:center; padding:20px 0;'>"
-            f"<span style='font-size:28px; color:#4a8af4;'>{pulse}</span><br>"
-            f"<span style='color:#8899aa; font-size:13px;'>{self._loading_base_text}{dots}</span>"
+            f"<span style='font-size:28px; color:#2255cc;'>{pulse}</span><br>"
+            f"<span style='color:#556677; font-size:13px;'>{self._loading_base_text}{dots}</span>"
             f"</div>"
         )
 
@@ -607,13 +635,13 @@ class ResultWindow(QWidget):
             num = i + 1
             if i == self._speech_selected:
                 html += (
-                    f"<div style='background:#3a5a3a;color:#fff;padding:3px 6px;"
+                    f"<div style='background:#ccddcc;color:#fff;padding:3px 6px;"
                     f"border-radius:4px;margin:2px 0;'>"
                     f"<b>▶ [{num}]</b> {s}</div>"
                 )
             else:
                 html += (
-                    f"<div style='color:#99bb99;padding:2px 6px;margin:1px 0;'>"
+                    f"<div style='color:#446644;padding:2px 6px;margin:1px 0;'>"
                     f"<b>[{num}]</b> {s}</div>"
                 )
         self._speech_text.setHtml(html)
@@ -653,7 +681,7 @@ class ResultWindow(QWidget):
 
         container = QWidget()
         container.setFixedSize(82, 76)
-        container.setStyleSheet("background: #2a2a35; border-radius: 4px;")
+        container.setStyleSheet("background: #f0f0f3; border-radius: 4px;")
 
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(3, 3, 3, 1)
@@ -663,16 +691,16 @@ class ResultWindow(QWidget):
         img_label.setPixmap(pm)
         img_label.setFixedSize(70, 52)
         img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img_label.setStyleSheet("border: 1px solid #4a4a55; border-radius: 2px;")
+        img_label.setStyleSheet("border: 1px solid #c0c0c8; border-radius: 2px;")
         vbox.addWidget(img_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         idx = len(self._thumb_widgets)
         del_btn = QPushButton(f"✕ {idx + 1}")
         del_btn.setFixedSize(50, 16)
         del_btn.setStyleSheet("""
-            QPushButton { background: #c0392b; color: white; border: none;
+            QPushButton { background: #cc4444; color: white; border: none;
                 border-radius: 2px; font-size: 9px; padding: 0; }
-            QPushButton:hover { background: #e74c3c; }
+            QPushButton:hover { background: #dd5555; }
         """)
         del_btn.clicked.connect(lambda _, i=idx: self._remove_thumbnail(i))
         vbox.addWidget(del_btn, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -805,17 +833,17 @@ class ResultWindow(QWidget):
         # 2. 代码块 ```...```
         html = re.sub(
             r'```(\w*)\n(.*?)```',
-            r'<pre style="background:#1e1e2a;padding:10px;border-radius:4px;overflow-x:auto;"><code>\2</code></pre>',
+            r'<pre style="background:#f0f0f3;padding:10px;border-radius:4px;overflow-x:auto;"><code>\2</code></pre>',
             html, flags=re.DOTALL)
         # 行内代码 `...`
         html = re.sub(
             r'`([^`]+)`',
-            r'<code style="background:#2a2a35;padding:1px 4px;border-radius:3px;color:#f0c070;">\1</code>',
+            r'<code style="background:#f0f0f3;padding:1px 4px;border-radius:3px;color:#886600;">\1</code>',
             html)
         # 标题
-        html = re.sub(r'^### (.+)$', r'<h3 style="color:#88aaff;margin:8px 0;">\1</h3>', html, flags=re.MULTILINE)
-        html = re.sub(r'^## (.+)$', r'<h2 style="color:#88ccff;margin:10px 0;">\1</h2>', html, flags=re.MULTILINE)
-        html = re.sub(r'^# (.+)$', r'<h1 style="color:#aaddff;margin:12px 0;">\1</h1>', html, flags=re.MULTILINE)
+        html = re.sub(r'^### (.+)$', r'<h3 style="color:#2255aa;margin:8px 0;">\1</h3>', html, flags=re.MULTILINE)
+        html = re.sub(r'^## (.+)$', r'<h2 style="color:#2266aa;margin:10px 0;">\1</h2>', html, flags=re.MULTILINE)
+        html = re.sub(r'^# (.+)$', r'<h1 style="color:#1144aa;margin:12px 0;">\1</h1>', html, flags=re.MULTILINE)
         # 粗体 / 斜体
         html = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', html)
         html = re.sub(r'\*(.+?)\*', r'<i>\1</i>', html)
@@ -823,12 +851,12 @@ class ResultWindow(QWidget):
         html = re.sub(r'^- (.+)$', r'<li>\1</li>', html, flags=re.MULTILINE)
         html = re.sub(r'^\d+\. (.+)$', r'<li>\1</li>', html, flags=re.MULTILINE)
         # 水平线
-        html = re.sub(r'^---$', r'<hr style="border:0;border-top:1px solid #444;">', html, flags=re.MULTILINE)
+        html = re.sub(r'^---$', r'<hr style="border:0;border-top:1px solid #d0d0d5;">', html, flags=re.MULTILINE)
         html = html.replace("\n\n", "<br><br>")
 
         return f"""
         <div style="font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif;
-                    font-size: {RESULT_FONT_SIZE}px; line-height: 1.6; color: #e0e0e0;">
+                    font-size: {RESULT_FONT_SIZE}px; line-height: 1.6; color: #1a1a1a;">
             {html}
         </div>
         """
@@ -873,8 +901,8 @@ class ResultWindow(QWidget):
                     html_parts.append("<tr>")
                     for c in cells:
                         html_parts.append(
-                            f'<th style="border:1px solid #3a4a5a;padding:6px 12px;'
-                            f'background:#2a3a50;color:#aaccff;text-align:left;">{c}</th>'
+                            f'<th style="border:1px solid #c0c8d0;padding:6px 12px;'
+                            f'background:#d8e0e8;color:#2255aa;text-align:left;">{c}</th>'
                         )
                     html_parts.append("</tr>")
                 else:
@@ -882,7 +910,7 @@ class ResultWindow(QWidget):
                     html_parts.append("<tr>")
                     for c in cells:
                         html_parts.append(
-                            f'<td style="border:1px solid #3a3a45;padding:5px 10px;'
+                            f'<td style="border:1px solid #c8c8d0;padding:5px 10px;'
                             f'vertical-align:top;">{c}</td>'
                         )
                     html_parts.append("</tr>")
@@ -1094,11 +1122,11 @@ class ResultWindow(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #2a2a32; color: #e0e0e0;
-                border: 1px solid #444; padding: 4px;
+                background-color: #f0f0f3; color: #1a1a1a;
+                border: 1px solid #d0d0d5; padding: 4px;
             }
             QMenu::item { padding: 6px 20px; }
-            QMenu::item:selected { background-color: #3a5a8c; }
+            QMenu::item:selected { background-color: #aac0dd; }
         """)
 
         clear_action = QAction("清空内容", self)

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 图片处理工具：QImage ↔ PIL 互转、压缩、Base64 编码
 """

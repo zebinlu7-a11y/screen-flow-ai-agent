@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 上下文持久化：将 LangChain 消息序列化为 JSON 并保存/加载。
 

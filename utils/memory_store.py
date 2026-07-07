@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 长期记忆管理 — AI 提取事实 + 关键词检索 + 注入 System Prompt。
 

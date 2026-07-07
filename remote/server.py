@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 手机远程控制 PC 服务 — aiohttp HTTP API (轮询模式, 兼容所有手机浏览器)
 """
@@ -43,8 +44,17 @@ class RemoteServer:
         # 最终结果
         self._final_result: Optional[dict] = None
         self._agent_running = False
+        # 手机指令去重：3秒内重复指令忽略
+        self._last_command = ""
+        self._last_command_time = 0.0
 
-        self._html_path = os.path.join(os.path.dirname(__file__), "phone.html")
+        # PyInstaller 打包后 __file__ 指向临时目录，用 sys._MEIPASS 获取真实路径
+        import sys as _sys
+        if getattr(_sys, 'frozen', False):
+            _base = _sys._MEIPASS
+        else:
+            _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._html_path = os.path.join(_base, "remote", "phone.html")
         self._setup_routes()
 
     def _setup_routes(self):
@@ -73,12 +83,14 @@ class RemoteServer:
         with self._screenshot_lock:
             img = self._latest_screenshot
             img_time = self._latest_screenshot_time
+        result = self._final_result
+        self._final_result = None
         return web.json_response({
             "logs": new_logs,
             "last_id": last_id,
             "screenshot": img,
             "img_time": img_time,
-            "result": self._final_result,
+            "result": result,
             "state": "running" if self._agent_running else "ready",
         })
 
@@ -86,13 +98,20 @@ class RemoteServer:
         try:
             data = await request.json()
             text = data.get("text", "").strip()
+            if not text:
+                return web.json_response({"ok": True})
+            now = time.time()
+            # 3秒内重复指令忽略
+            if text == self._last_command and now - self._last_command_time < 3.0:
+                return web.json_response({"ok": True, "skipped": True})
+            self._last_command = text
+            self._last_command_time = now
             print(f"[Remote] HTTP收到指令: {text}")
-            if text:
-                self._add_log(f"📨 收到指令: {text}")
-                if self.on_command:
-                    self.on_command(text)
-                self._agent_running = True
-                self._final_result = None
+            self._add_log(f"📨 收到指令: {text}")
+            if self.on_command:
+                self.on_command(text)
+            self._agent_running = True
+            self._final_result = None
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)

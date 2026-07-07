@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 GUI Agent RPA — ReAct core decision + Loop Engineer controller.
 
@@ -731,7 +732,9 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - maximize: 最大化/恢复浏览器窗口，不需要 text
 - read_page: 读取当前网页可见文本/标题/链接并放入历史，不需要 text
 
-优先输出这些 action 名；type 视为旧版 fill，press 视为旧版 hotkey。"""
+优先输出这些 action 名；type 视为旧版 fill，press 视为旧版 hotkey。
+- 如果你完全无法确认目标在哪（截图里找不到相关元素），请返回 ask_user 让用户协助指定，不要随机或胡乱点击坐标。
+- ask_user 格式: {{"done": false, "action": "ask_user", "text": "你希望我点击的xxx具体在哪？能描述一下位置或形状吗？"}}"""
 
 
 def react_decide(task: str, image: Image.Image, history: List[str],
@@ -1339,9 +1342,22 @@ def run_gui_task(task: str,
         decision = react_decide(task, img, history, operation_context=operation_context)
 
         if decision.get("done"):
+            reason = decision.get("reason", "任务已完成")
             if progress_callback:
-                progress_callback(f"✅ ReAct 判定完成: {decision.get('reason', '')}")
+                progress_callback(f"✅ ReAct 判定完成: {reason}，进入最终审计。")
             break
+
+        # ---- 关键：执行动作前再次检查取消信号 ----
+        if cancel_file and os.path.exists(cancel_file):
+            print("[Cancelled] 动作执行前检测到 ESC 取消信号，跳过动作")
+            if mcp and not keep_browser_open:
+                mcp.close()
+            return {
+                "success": False, "canceled": True,
+                "message": "操作已被用户取消 (ESC)",
+                "steps_done": f"{len(history)}/{iteration}",
+                "need_human": False,
+            }
 
         # Execute action
         action = decision.get("action", "click")
@@ -1387,6 +1403,18 @@ def run_gui_task(task: str,
                 progress_callback("  📄 read_page")
             else:
                 progress_callback(f"  ⏳ {action}: {text}")
+
+        if cancel_file and os.path.exists(cancel_file):
+            print("[Cancelled] Cancel signal detected before executing action")
+            if mcp and not keep_browser_open:
+                mcp.close()
+            return {
+                "success": False,
+                "canceled": True,
+                "message": "操作已被用户取消 (ESC)",
+                "steps_done": f"{len(history)}/{iteration}",
+                "need_human": False,
+            }
 
         try:
             if action == "click":
@@ -1479,6 +1507,18 @@ def run_gui_task(task: str,
                     time.sleep(2)
                 else:
                     _open_url_in_browser(text, mcp)
+            elif action == "ask_user":
+                # AI 不确定，询问用户 — 直接结束循环返回提示
+                ask_msg = text or "当前截图未找到明确目标，请描述你想点击的位置或下一步操作。"
+                print(f"[ReAct] ask_user: {ask_msg}")
+                history.append(f"[{iteration+1}] {thought} → ask_user: {ask_msg}")
+                return {
+                    "success": False,
+                    "message": f"AI 不确定下一步：{ask_msg}",
+                    "steps_done": f"{len(history)}/{iteration+1}",
+                    "need_human": True,
+                    "elapsed": f"{time.time() - start_time:.1f}s",
+                }
             else:
                 print(f"[ReAct] 未知动作: {action}")
         except Exception as e:
@@ -1491,6 +1531,7 @@ def run_gui_task(task: str,
         elif action in ("type", "press", "scroll", "multi_scroll", "page_jump"):
             action_desc += f" \"{text}\""
         history.append(f"[{iteration+1}] {thought} → {action_desc}")
+
         time.sleep(1.5)
 
         # Update action fingerprint for the next ReAct step.

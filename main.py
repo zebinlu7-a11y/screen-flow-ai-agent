@@ -1,4 +1,4 @@
-"""
+﻿"""
 AIRAG — 智能截图解析悬浮窗工具 主入口
 
 流程：
@@ -14,6 +14,7 @@ AIRAG — 智能截图解析悬浮窗工具 主入口
   - 程序状态指示
   - 退出程序
 """
+
 import sys
 import os
 import json
@@ -36,8 +37,9 @@ from pynput import keyboard as pynput_keyboard
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 
 from config import (
-    DEFAULT_HOTKEY, TOGGLE_HOTKEY, OCR_HOTKEY, QUIT_HOTKEY,
+    DEFAULT_HOTKEY, TOGGLE_HOTKEY, OCR_HOTKEY, LEETCODE_HOTKEY, QUIT_HOTKEY,
     CONTEXT_FILE, HTTP_PROXY, RECENT_ROUNDS,
+    FULLSCREEN_CAPTURE_PROMPT,
 )
 from utils.image_tool import qimage_to_pil, pil_to_base64, compress_image
 from utils.context_store import load_context, save_context
@@ -427,7 +429,6 @@ class _RemoteAgentThread(QThread):
                 msg = f"[{steps}] {msg}"
             if elapsed:
                 msg = f"({elapsed}) {msg}"
-            self._remote.send_result(success, msg, elapsed)
             self.done.emit(success, msg)
             if not success or result.get("canceled"):
                 self._stop_event.set()
@@ -685,6 +686,7 @@ class ScreenAIAgent(QObject):
                 '<ctrl>+d': self._on_hotkey_triggered,
                 '<ctrl>+f': self._on_hotkey_toggle,
                 '<ctrl>+r': self._on_ocr_hotkey,
+                '<ctrl>+k': self._on_leetcode_hotkey,
                 '<ctrl>+y': self._on_speech_hotkey,
                 '<ctrl>+g': self._on_gui_agent_hotkey,
                 '<ctrl>+q': self._on_quit_hotkey,
@@ -697,6 +699,7 @@ class ScreenAIAgent(QObject):
             print(f"[AIRAG] [OK] 快捷键注册成功 (pynput)")
             print(f"         Ctrl+D — 截图发送")
             print(f"         Ctrl+R — OCR 文字识别")
+            print(f"         Ctrl+K — LeetCode 编程解答")
             print(f"         Ctrl+F — 隐藏/显示窗口")
             print(f"         Ctrl+Q — 退出程序")
         except Exception as e:
@@ -784,6 +787,45 @@ class ScreenAIAgent(QObject):
 
         self._result_window.show()
         self._result_window.raise_()
+
+    # ============================================================
+    # Ctrl+K Leetcode 模式
+    # ============================================================
+
+    def _on_leetcode_hotkey(self, key=None):
+        """Ctrl+K 回调 — 截图 + LeetCode 格式回答。"""
+        QTimer.singleShot(0, self._start_leetcode_flow)
+
+    def _start_leetcode_flow(self):
+        """打开截图遮罩，LeetCode 模式。"""
+        if self._capture_win is not None and self._capture_win.isVisible():
+            return
+        self._result_window.hide()
+        QApplication.processEvents()
+        self._capture_win = CaptureWindow()
+        self._capture_win.captured.connect(self._on_leetcode_captured)
+        self._capture_win.destroyed.connect(lambda: self._result_window.show() if not self._result_window.isVisible() else None)
+        self._capture_win.showFullScreen()
+
+    def _on_leetcode_captured(self, images: list):
+        """LeetCode 截图完成 → 立即用编程提示词发给 AI。"""
+        self._capture_win = None
+        if not images:
+            return
+
+        image_base64_list = []
+        for img, _ in images:
+            pil_img = qimage_to_pil(img)
+            pil_img = compress_image(pil_img)
+            image_base64_list.append(pil_to_base64(pil_img))
+
+        # 用 LeetCode 提示词作为用户消息
+        user_text = FULLSCREEN_CAPTURE_PROMPT
+        self._last_user_text = user_text
+        self._last_image_b64_list = image_base64_list
+
+        # 直接发送给 AI
+        self._run_ai_stream(user_text, image_base64_list)
 
     # ============================================================
     # Step 1: Capture
@@ -964,15 +1006,28 @@ class ScreenAIAgent(QObject):
         """ESC 回调：取消当前操作 / 停止远程 Agent。"""
         thread = getattr(self, "_agent_thread", None)
         if thread and thread.isRunning():
+            self._result_window.stop_loading()
+            # 断开信号，防止旧线程的 done 信号重复触发
+            try:
+                thread.progress.disconnect()
+                thread.done.disconnect()
+            except Exception:
+                pass
+            # 远程会话也直接终止，不再保留复用
             if hasattr(thread, "stop_agent"):
-                self._result_window.append_text("\n⏹️ **正在取消当前远程操作并终止 Agent 进程...**\n")
-                thread.cancel()
-            else:
-                self._result_window.append_text("\n⏹️ **ESC 按下 — 正在取消操作...**\n")
-                thread.cancel()
-                self._agent_thread = None
-        else:
-            self._result_window.append_text("\n⚠️ 当前没有正在执行的自动化操作。\n")
+                thread.stop_agent()
+            thread.cancel()
+            self._agent_thread = None
+            self._release_remote_task_state()
+
+    def _release_remote_task_state(self):
+        self._remote_session = False
+        self._remote_task_running = False
+        self._remote_current_task = ""
+        self._remote_result_sent = False
+        self._remote_pending_task = None
+        if self._remote_server:
+            self._remote_server.send_result(False, "操作已取消，可以发送新指令。")
 
     def _screen_pusher_loop(self):
         """后台线程：持续截图推送给手机。"""
@@ -1006,7 +1061,7 @@ class ScreenAIAgent(QObject):
             self._result_window.append_text(f"\n**{status}：** {msg}\n")
 
         # 向远程手机发送结果
-        if self._remote_server:
+        if self._remote_server and getattr(self, "_remote_session", False) and not self._remote_result_sent:
             elapsed = ""
             try:
                 # 尝试从 msg 提取耗时
@@ -1017,6 +1072,7 @@ class ScreenAIAgent(QObject):
             except Exception:
                 pass
             self._remote_server.send_result(success, msg, elapsed)
+            self._remote_result_sent = True
 
         user_msg = HumanMessage(content=self._last_user_text)
         log_text = "\n".join(self._agent_log_lines[-20:]) if hasattr(self, "_agent_log_lines") else ""
@@ -1028,6 +1084,9 @@ class ScreenAIAgent(QObject):
         self._messages.append(assistant_msg)
         self._save_current_conv()
         self._last_user_text = ""
+        if getattr(self, "_remote_session", False):
+            self._remote_task_running = False
+            self._remote_current_task = ""
         # 远程会话保持线程不释放, 等下一轮指令复用
         if not getattr(self, "_remote_session", False):
             self._agent_thread = None
@@ -1167,6 +1226,9 @@ class ScreenAIAgent(QObject):
             port = 8765
 
         self._remote_pending_task: Optional[str] = None  # 手机发来的待处理指令
+        self._remote_current_task = ""
+        self._remote_task_running = False
+        self._remote_result_sent = False
 
         self._remote_server = RemoteServer(port=port)
         self._remote_server.on_command = self._on_remote_command
@@ -1204,6 +1266,12 @@ class ScreenAIAgent(QObject):
         if self._is_remote_stop_command(task):
             self._stop_remote_agent()
             return
+        if self._remote_task_running:
+            if task == self._remote_current_task:
+                self._remote_server.send_progress("任务正在执行，已忽略重复指令。")
+                return
+            self._remote_server.send_progress("上一条任务还在执行中，请先取消或等待完成。")
+            return
         print(f"[Remote] 执行: {task}")
         self._remote_server.send_progress(f"执行: {task}")
         if thread and thread.isRunning() and hasattr(thread, "send_task"):
@@ -1227,6 +1295,9 @@ class ScreenAIAgent(QObject):
 
     def _start_remote_agent(self, task: str):
         self._remote_session = True
+        self._remote_current_task = task
+        self._remote_task_running = True
+        self._remote_result_sent = False
         self._last_user_text = task
         self._agent_log_lines = []
         self._agent_thread = _RemoteAgentThread(
@@ -1246,7 +1317,7 @@ class ScreenAIAgent(QObject):
             self._remote_server.send_progress("正在结束远程 Agent 进程。")
             thread.stop_agent()
         self._agent_thread = None
-        self._remote_session = False
+        self._release_remote_task_state()
 
     def _push_remote_screenshot(self):
         """截图推送给远程手机."""
@@ -1289,6 +1360,13 @@ class ScreenAIAgent(QObject):
 
     def _on_remote_command(self, task: str):
         """手机发来指令 → 设置标记, 主线程定时检查并处理."""
+        if self._remote_task_running:
+            if task == self._remote_current_task:
+                return
+            self._remote_server.send_progress("上一条任务还在执行中，请先取消或等待完成。")
+            return
+        if self._remote_pending_task == task:
+            return
         self._remote_pending_task = task
         self._remote_server.send_progress(f"📨 已收到: {task}")
 

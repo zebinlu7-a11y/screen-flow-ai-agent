@@ -54,6 +54,7 @@ let lastLogId = 0;
 let lastImgTime = '';
 let connected = false;
 let pollTimer = null;
+let lastResultKey = '';
 
 function connect() {
   setStatus('连接中...');
@@ -92,7 +93,11 @@ function poll() {
     }
     // 结果
     if (data.result) {
-      log(data.result.success ? '✅ ' + data.result.message : '❌ ' + data.result.message, data.result.success);
+      const resultKey = String(data.result.success) + '|' + String(data.result.message) + '|' + String(data.result.elapsed || '');
+      if (resultKey !== lastResultKey) {
+        lastResultKey = resultKey;
+        log(data.result.success ? '✅ ' + data.result.message : '❌ ' + data.result.message, data.result.success);
+      }
       setStatus(data.result.success ? '完成' : '失败');
       enableButtons(true);
     }
@@ -112,15 +117,20 @@ function sendCommand() {
     .then(r => r.json()).then(d => {
       log('📨 ' + text);
       input.value = '';
-      enableButtons(false);
+      enableButtons(!!d.skipped);
       // 立即轮询一次
       poll();
-    }).catch(() => log('⚠️ 发送失败', false));
+    }).catch(() => {
+      enableButtons(true);
+      log('⚠️ 发送失败', false);
+    });
 }
 
 function cancelTask() {
   fetch('/api/cancel', {method:'POST'}).then(r => r.json()).then(() => {
     log('⏹️ 已发送取消信号');
+    enableButtons(true);
+    setStatus('ready');
   }).catch(() => log('⚠️ 取消失败', false));
 }
 

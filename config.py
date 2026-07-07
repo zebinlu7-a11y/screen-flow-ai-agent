@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 AIRAG 全局配置文件
 """
@@ -11,6 +12,7 @@ from utils.api_key_manager import get_api_key, get_model, get_proxy
 DEFAULT_HOTKEY = "ctrl+d"
 TOGGLE_HOTKEY = "ctrl+f"
 OCR_HOTKEY = "ctrl+r"
+LEETCODE_HOTKEY = "ctrl+k"
 QUIT_HOTKEY = "ctrl+q"
 
 # ============================================================
@@ -98,20 +100,30 @@ REDIS_SHORT_TERM_MAX_MESSAGES = int(os.environ.get("AIRAG_REDIS_MAX_MESSAGES", "
 REDIS_KEEP_IMAGE_TURNS = int(os.environ.get("AIRAG_REDIS_KEEP_IMAGE_TURNS", "2"))
 
 # ============================================================
+# Ctrl+K 全屏截图提示词
+# ============================================================
+FULLSCREEN_CAPTURE_PROMPT = os.environ.get(
+    "AIRAG_FULLSCREEN_PROMPT",
+    "你是一名专业编程老师，根据截图内容回答编写leetcode格式的代码并且给我注释代码含义便于理解，只输出相关代码和注释，不要输出其他内容和废话",
+)
+
+# ============================================================
 # UI 配置
 # ============================================================
 # 截图遮罩
-MASK_OPACITY = 0.3            # 遮罩层透明度
+MASK_OPACITY = 0.6           # 遮罩层透明度
 HANDLE_SIZE = 8               # 锚点大小(像素)
 HANDLE_HIT_RADIUS = 10        # 锚点点击检测半径
 
 # 结果窗口
-RESULT_WINDOW_WIDTH = 500     # 默认宽度
-RESULT_WINDOW_HEIGHT = 400    # 默认高度
-RESULT_WINDOW_OPACITY = 0.92  # 窗口不透明度
+RESULT_WINDOW_WIDTH = 100     # 默认宽度
+RESULT_WINDOW_HEIGHT = 80    # 默认高度
+RESULT_WINDOW_OPACITY = 0.75  # 窗口不透明度
 RESULT_FONT_SIZE = 13         # 字体大小
-RESULT_BG_COLOR = "rgba(30, 30, 30, 0.92)"  # 深色半透明背景
-RESULT_TEXT_COLOR = "#e0e0e0"  # 文字颜色
+RESULT_BG_COLOR = "rgba(255, 255, 255, 0.68)"  # 浅色半透明背景
+RESULT_TEXT_COLOR = "#1a1a1a"  # 深色文字
+# 初始位置: None=自动右下角, 或者固定 (x, y) 如 (100, 200)
+RESULT_INITIAL_POS = (100,100)
 
 # 输入窗口
 INPUT_WINDOW_WIDTH = 420

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 快捷输入窗口 — 截图完成后弹出，显示缩略图预览 + 追问输入。
 支持多图缩略图预览、× 删除单张、Enter 确认发送、Escape 取消。
@@ -46,6 +47,7 @@ class InputDialog(QDialog):
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         # 深色背景
         palette = self.palette()
@@ -90,6 +92,8 @@ class InputDialog(QDialog):
         self._text_edit = QTextEdit()
         self._text_edit.setPlaceholderText("输入你的问题，例如：请分析这些截图的内容...")
         self._text_edit.setFont(QFont("Microsoft YaHei", 11))
+        self._text_edit.setCursor(Qt.CursorShape.ArrowCursor)
+        self._text_edit.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self._text_edit.setStyleSheet("""
             QTextEdit {
                 background-color: #2a2a30; color: #e8e8e8;
@@ -105,6 +109,7 @@ class InputDialog(QDialog):
         btn_layout.setSpacing(10)
 
         self._skip_btn = QPushButton("取消 (Esc)")
+        self._skip_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._skip_btn.setStyleSheet("""
             QPushButton {
                 background-color: #3a3a40; color: #aaa; border: 1px solid #555;
@@ -115,6 +120,7 @@ class InputDialog(QDialog):
         self._skip_btn.clicked.connect(self._on_skip)
 
         self._confirm_btn = QPushButton("发送 (Enter)")
+        self._confirm_btn.setCursor(Qt.CursorShape.ArrowCursor)
         self._confirm_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2b5db8; color: white; border: 1px solid #3a6fd8;
@@ -258,7 +264,9 @@ class InputDialog(QDialog):
     def keyPressEvent(self, event):
         key = event.key()
         if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self._on_confirm()
+            elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 self._text_edit.insertPlainText("\n")
             else:
                 self._on_confirm()

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """AIRAG 打包脚本 — 运行此脚本生成 exe"""
 import sys
 sys.setrecursionlimit(10000)

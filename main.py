@@ -30,7 +30,7 @@ import traceback
 from typing import Optional, List
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QThread, QRect
-from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtGui import QIcon, QAction, QImage
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
 from pynput import keyboard as pynput_keyboard
@@ -797,35 +797,34 @@ class ScreenAIAgent(QObject):
         QTimer.singleShot(0, self._start_leetcode_flow)
 
     def _start_leetcode_flow(self):
-        """打开截图遮罩，LeetCode 模式。"""
-        if self._capture_win is not None and self._capture_win.isVisible():
-            return
+        """Ctrl+K — 直接全屏截图 → AI 编程解答，无需框选。"""
         self._result_window.hide()
         QApplication.processEvents()
-        self._capture_win = CaptureWindow()
-        self._capture_win.captured.connect(self._on_leetcode_captured)
-        self._capture_win.destroyed.connect(lambda: self._result_window.show() if not self._result_window.isVisible() else None)
-        self._capture_win.showFullScreen()
 
-    def _on_leetcode_captured(self, images: list):
-        """LeetCode 截图完成 → 立即用编程提示词发给 AI。"""
-        self._capture_win = None
-        if not images:
+        screen = QApplication.primaryScreen()
+        if not screen:
             return
 
-        image_base64_list = []
-        for img, _ in images:
-            pil_img = qimage_to_pil(img)
-            pil_img = compress_image(pil_img)
-            image_base64_list.append(pil_to_base64(pil_img))
+        # 直接截全屏
+        pixmap = screen.grabWindow(0)
+        image = pixmap.toImage()
 
-        # 用 LeetCode 提示词作为用户消息
+        # 压缩 → Base64
+        pil_img = qimage_to_pil(image)
+        pil_img = compress_image(pil_img)
+        image_base64 = pil_to_base64(pil_img)
+
+        # 用 LeetCode 提示词
         user_text = FULLSCREEN_CAPTURE_PROMPT
         self._last_user_text = user_text
-        self._last_image_b64_list = image_base64_list
+        self._last_image_b64_list = [image_base64]
 
-        # 直接发送给 AI
-        self._run_ai_stream(user_text, image_base64_list)
+        self._result_window.show()
+        self._result_window.raise_()
+        self._run_ai_stream(user_text, [image_base64])
+
+    def _on_leetcode_captured(self, images: list):
+        pass  # 不再使用，保留兼容
 
     # ============================================================
     # Step 1: Capture

@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Ai_Flow" width="96" height="86">
 </p>
 
-<h2 align="center">Ai_Flow — 智能桌面助手</h2>
+<h2 align="center">Ai_Flow — 智能远程桌面AI助手</h2>
 
 <p align="center">
   <b>截图+AI 流式对话 · ReAct 桌面自动化 · 手机远程控制 · 长期记忆 · 隐私保护</b>
@@ -24,7 +24,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 - **桌面自动化** — `Ctrl+G` 或输入 `自动 任务`，ReAct Agent 自动操作桌面/浏览器
 - **手机远程控制** — 手机浏览器扫码，实时看截图+发指令+控制 PC
 - **浏览器自动化** — Playwright MCP Server + CDP 双引擎，自动打开网页操作
-- **语音输入** — `Ctrl+Y` 实时语音转文字，滚轮选句子
+- **语音输入** — `Ctrl+Y` 实时语音转文字，滚轮选句子，AI问答
 
 ## 操作演示
 
@@ -197,7 +197,7 @@ python main.py
 
 ## 下载
 
-[**Ai_Flow.zip**](https://github.com/zebinlu7-a11y/screen-flow-ai-agent/releases/download/v1.0/Ai_Flow.zip)（75MB），解压双击 `Ai_Flow.exe` 运行。
+pyinstaller打包压缩成ZIP，解压双击 `Ai_Flow.exe` 运行。
 
 ## 架构
 
@@ -341,8 +341,8 @@ AIRAG/
 | 层级 | 数据来源 | 生命周期 | 检索方式 |
 |------|---------|---------|---------|
 | **短期** | 最近 3 轮对话原文 | 当前会话 | 直接拼入 prompt，不检索 |
-| **中期** | 3 轮之前的对话消息 | 当前会话 | BM25 召回 → RRF 融合 → rerank 精排 |
-| **长期** | AI 提炼的用户事实 (身份/偏好/项目/问题/知识) | 跨会话永久 | BM25 + 关键词双路 → RRF → rerank → 注入 prompt |
+| **中期** | 3 轮之前的对话消息 | 当前会话 | BM25+语义 → RRF 融合 → rerank 精排 |
+| **长期** | AI 提炼的用户事实 (身份/偏好/项目/问题/知识) | 跨会话永久 | 语义 + 关键词双路 → RRF → rerank → 注入 prompt |
 
 长期记忆在对话结束后由后台 `MemWorker` 异步提取，不阻塞用户操作。
 

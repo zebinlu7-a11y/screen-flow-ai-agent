@@ -44,11 +44,11 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 **GUI Agent 桌面自动化** — AI 看截图自己决定每一步操作。
 
-<img src="assets/user6.jpg" alt="GUI Agent" width="700">
+<img src="assets/user6.jpg" alt="GUI Agent" width="300">
 
 **手机远程控制** — 手机浏览器扫码，实时看 PC 屏幕 + 发送指令。
 
-<img src="assets/user5.png" alt="手机远程控制" width="220">
+<img src="assets/user5.png" alt="手机远程控制" width="320">
 
 ## 快捷键
 

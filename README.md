@@ -48,7 +48,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 **手机远程控制** — 手机浏览器扫码，实时看 PC 屏幕 + 发送指令。
 
-<img src="assets/user5.png" alt="手机远程控制" width="320">
+<img src="assets/user5.png" alt="手机远程控制" width="520">
 
 ## 快捷键
 
@@ -134,7 +134,7 @@ ReAct Loop (最多 15 步):
 |------|------|
 | **纯视觉定位** | 模型直接看截图返回归一化坐标 (0-1000)，`pixel = normalized * img_dim / 1000` |
 | **ReAct 范式** | 每步观察→思考→行动，AI 动态决策，不依赖预定义步骤 |
-| **9 种动作** | click / double / right / move / drag / fill / hotkey / scroll / wait |
+| **多种动作** | click / double / right / move / drag / fill / hotkey / scroll / wait |
 | **安全机制** | ESC 立即终止、最大 15 步、连续 3 次相同动作自动退出、`Alt+F4` 智能拦截 |
 | **进程隔离** | Agent 跑在独立子进程，崩溃不影响 UI，方便取消和资源回收 |
 

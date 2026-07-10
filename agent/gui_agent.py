@@ -698,13 +698,13 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 
 返回 JSON（只输出JSON）:
 任务未完成:
-{{"done": false, "thought": "当前看到xxx, 下一步应该xxx", "action": "click", "x": 500, "y": 300, "text": ""}}
+{{"done": false, "state": "当前界面状态", "goal": "当前子目标", "strategy": "primary", "attempt": 1, "thought": "当前看到xxx, 下一步应该xxx", "action": "click", "x": 500, "y": 300, "text": ""}}
 
 任务已完成:
 {{"done": true, "reason": "任务完成了，当前屏幕显示xxx证明xxx"}}
 
 不确定时先等待:
-{{"done": false, "action": "wait", "text": "2"}}
+{{"done": false, "state": "页面可能正在加载", "goal": "等待界面稳定", "strategy": "wait", "attempt": 1, "thought": "等待页面加载后再判断", "action": "wait", "text": "2"}}
 
 重要：不要按文字查找元素，也不要输出 selector 或元素文字定位。只根据截图判断坐标并调用基础工具。
 正式动作集：
@@ -772,8 +772,14 @@ Additional execution rules:
 10. For file/folder/PPT tasks, use desktop tools too: double click folders/files, alt_tab, focus_window, page_down/page_up, hotkey f5/escape, and scroll in the visible slide/page area.
 11. For PPT/page navigation, estimate the gap to the target page from the screenshot and history. Use page_jump or multi_scroll instead of moving one page per step. Example: if current page is 1 and target is 10, use page_jump text="9".
 12. Use the operation memory context as the current desktop/application state. If the user asks a follow-up like "再翻到第十页", continue from the remembered workflow and current screenshot.
-13. Two consecutive failed or repeated steps must switch to a different method. Try at most five different recovery methods, then return done=true with a failure reason and ask the user to re-enter clearer instructions.
-14. Return JSON. You may include plan/status, but must include done/action/thought or done/reason.
+13. Think internally before every action: goal -> current state -> likely next action -> backup action if it fails. Keep the visible thought short; do not expose long chain-of-thought.
+14. Return state, goal, strategy, and attempt on every unfinished step. Treat strategy as the method category, e.g. primary_visual, menu_path, keyboard_shortcut, command_palette, search_box, context_menu, window_focus, direct_open, recovery_observe.
+15. Try at most one action per strategy before switching when the screen does not change, the action repeats, or the target remains absent. Do not repeat the same coordinate/action more than twice.
+16. Two consecutive failed, repeated, or unchanged-screen steps must switch to a different method. Prefer a new strategy category, such as keyboard shortcut, menu path, search box, double click, context menu, page navigation, window focus, or direct URL/open command.
+17. If a task is phrased loosely, normalize it to a concrete UI goal before acting. Examples: "recent folder" means try welcome-page recent item first, then File/Open Recent menu, then command palette/search.
+18. Do not ask the user immediately after one failed attempt. Try several distinct methods unless the target is genuinely ambiguous or destructive.
+19. After five ineffective strategy attempts, return action="ask_user" with a concise failure_reason and ask for permission/help, such as confirming the target window, granting permissions, or pointing to the target.
+20. Return JSON. You may include plan/status, but must include done/action/thought or done/reason.
 """
 
     content = [
@@ -1158,35 +1164,35 @@ def choose_recovery_action(action: str, text: str, x: int, y: int, attempts: int
     cycle = max(0, attempts - 1) % 5
     if action in ("click", "focus_window"):
         fallbacks = [
-            {"action": "double", "x_pixel": x, "y_pixel": y, "text": "recovery double click"},
-            {"action": "press", "text": "enter"},
-            {"action": "right", "x_pixel": x, "y_pixel": y, "text": "recovery context click"},
-            {"action": "alt_tab", "text": "recovery alt tab"},
-            {"action": "screenshot", "text": "recovery observe"},
+            {"action": "double", "x_pixel": x, "y_pixel": y, "text": "recovery double click", "strategy": "double_click_recovery"},
+            {"action": "press", "text": "enter", "strategy": "keyboard_confirm"},
+            {"action": "right", "x_pixel": x, "y_pixel": y, "text": "recovery context click", "strategy": "context_menu"},
+            {"action": "alt_tab", "text": "recovery alt tab", "strategy": "window_focus"},
+            {"action": "screenshot", "text": "recovery observe", "strategy": "observe"},
         ]
     elif action in ("scroll", "page_down", "page_up"):
         fallbacks = [
-            {"action": "page_down", "text": "recovery page down"},
-            {"action": "read_page" if mcp_connected else "zoom_out", "text": "recovery collect or zoom"},
-            {"action": "multi_scroll", "x_pixel": x, "y_pixel": y, "text": "down:5"},
-            {"action": "page_up", "text": "recovery page up"},
-            {"action": "screenshot", "text": "recovery observe"},
+            {"action": "page_down", "text": "recovery page down", "strategy": "page_navigation"},
+            {"action": "read_page" if mcp_connected else "zoom_out", "text": "recovery collect or zoom", "strategy": "collect_or_zoom"},
+            {"action": "multi_scroll", "x_pixel": x, "y_pixel": y, "text": "down:5", "strategy": "multi_scroll"},
+            {"action": "page_up", "text": "recovery page up", "strategy": "reverse_page_navigation"},
+            {"action": "screenshot", "text": "recovery observe", "strategy": "observe"},
         ]
     elif action in ("fill", "type"):
         fallbacks = [
-            {"action": "hotkey", "text": "ctrl+a"},
-            {"action": "type", "text": text},
-            {"action": "press", "text": "enter"},
-            {"action": "click", "x_pixel": x, "y_pixel": y, "text": "recovery refocus"},
-            {"action": "screenshot", "text": "recovery observe"},
+            {"action": "hotkey", "text": "ctrl+a", "strategy": "select_existing_text"},
+            {"action": "type", "text": text, "strategy": "retry_text_input"},
+            {"action": "press", "text": "enter", "strategy": "keyboard_confirm"},
+            {"action": "click", "x_pixel": x, "y_pixel": y, "text": "recovery refocus", "strategy": "refocus_input"},
+            {"action": "screenshot", "text": "recovery observe", "strategy": "observe"},
         ]
     else:
         fallbacks = [
-            {"action": "wait", "text": "1"},
-            {"action": "screenshot", "text": "recovery observe"},
-            {"action": "alt_tab", "text": "recovery alt tab"},
-            {"action": "maximize", "text": "recovery maximize"},
-            {"action": "observe_browser" if mcp_connected else "activate_browser", "text": "recovery observe browser"},
+            {"action": "wait", "text": "1", "strategy": "wait"},
+            {"action": "screenshot", "text": "recovery observe", "strategy": "observe"},
+            {"action": "alt_tab", "text": "recovery alt tab", "strategy": "window_focus"},
+            {"action": "maximize", "text": "recovery maximize", "strategy": "maximize_window"},
+            {"action": "observe_browser" if mcp_connected else "activate_browser", "text": "recovery observe browser", "strategy": "browser_focus"},
         ]
     return fallbacks[cycle]
 
@@ -1202,6 +1208,7 @@ class LoopController:
         self.forced_failure = ""
         self.last_image_fp = None
         self.unchanged_screen_count = 0
+        self.strategy_attempts = []
 
     def observe_image(self, image: Image.Image):
         current_fp = _image_fingerprint(image)
@@ -1212,35 +1219,42 @@ class LoopController:
         self.last_image_fp = current_fp
 
     def maybe_recover(self, action: str, text: str, x: int, y: int,
-                      x2: int, y2: int, mcp_connected: bool) -> tuple:
+                      x2: int, y2: int, strategy: str, mcp_connected: bool) -> tuple:
         predicted_action_key = f"{action}:{text}:{x}:{y}"
+        strategy = strategy or action or "primary"
+        if strategy not in self.strategy_attempts:
+            self.strategy_attempts.append(strategy)
         if predicted_action_key == self.last_action_key:
             self.same_action_count += 1
         else:
             self.same_action_count = 0
 
         if self.same_action_count < 1 and self.unchanged_screen_count < 2:
-            return action, text, x, y, x2, y2, ""
+            return action, text, x, y, x2, y2, strategy, len(self.strategy_attempts), ""
 
         self.recovery_attempts += 1
         if self.recovery_attempts > self.max_recoveries:
             self.forced_failure = (
                 f"连续多次操作无效，已尝试 {self.max_recoveries} 种替代方法仍未完成；"
-                "请重新输入更明确的指令。"
+                "请确认目标窗口是否在前台、是否需要权限，或描述目标位置让我继续。"
             )
-            return action, text, x, y, x2, y2, self.forced_failure
+            return "ask_user", self.forced_failure, x, y, x2, y2, "ask_user", len(self.strategy_attempts), self.forced_failure
 
         recovery = choose_recovery_action(action, text, x, y, self.recovery_attempts, mcp_connected)
         old_action = action
+        old_strategy = strategy
         action = recovery.get("action", action)
         text = recovery.get("text", text)
+        strategy = recovery.get("strategy", action)
+        if strategy not in self.strategy_attempts:
+            self.strategy_attempts.append(strategy)
         x = recovery.get("x_pixel", x)
         y = recovery.get("y_pixel", y)
         x2 = recovery.get("x2_pixel", x2)
         y2 = recovery.get("y2_pixel", y2)
         self.unchanged_screen_count = 0
-        note = f"检测到连续重复或画面未变化，自动从 {old_action} 切换为 {action}（第 {self.recovery_attempts}/{self.max_recoveries} 种方法）"
-        return action, text, x, y, x2, y2, note
+        note = f"检测到连续重复或画面未变化，自动从 {old_strategy}/{old_action} 切换为 {strategy}/{action}（第 {self.recovery_attempts}/{self.max_recoveries} 种方法）"
+        return action, text, x, y, x2, y2, strategy, len(self.strategy_attempts), note
 
     def record_action(self, action: str, text: str, x: int, y: int):
         self.last_action_key = f"{action}:{text}:{x}:{y}"
@@ -1394,18 +1408,30 @@ def run_gui_task(task: str,
         # Execute action
         action = decision.get("action", "click")
         thought = decision.get("thought", "")
+        state = decision.get("state", "")
+        goal = decision.get("goal", "")
+        strategy = decision.get("strategy", action)
+        attempt = decision.get("attempt", 1)
         text = decision.get("text", "")
         x = decision.get("x_pixel", 0)
         y = decision.get("y_pixel", 0)
         x2 = decision.get("x2_pixel", 0)
         y2 = decision.get("y2_pixel", 0)
 
-        action, text, x, y, x2, y2, loop_note = loop.maybe_recover(
-            action, text, x, y, x2, y2, bool(mcp and mcp.connected)
+        action, text, x, y, x2, y2, strategy, attempt, loop_note = loop.maybe_recover(
+            action, text, x, y, x2, y2, strategy, bool(mcp and mcp.connected)
         )
         if loop.forced_failure:
             print(f"[LoopController] {loop.forced_failure}")
-            break
+            if progress_callback:
+                progress_callback(f"  ❓ {loop.forced_failure}")
+            return {
+                "success": False,
+                "message": loop.forced_failure,
+                "steps_done": f"{len(history)}/{iteration+1}",
+                "need_human": True,
+                "elapsed": f"{time.time() - start_time:.1f}s",
+            }
         if loop_note:
             thought = f"{thought}；{loop_note}"
 
@@ -1420,6 +1446,8 @@ def run_gui_task(task: str,
             thought = f"{thought}；连续滚动后自动切换为 {action}，避免只滚动不收集信息"
 
         if progress_callback:
+            if state or goal or strategy:
+                progress_callback(f"  🧭 state={state[:40] or '-'} | goal={goal[:40] or '-'} | strategy={strategy} | attempt={attempt}")
             progress_callback(f"  💭 {thought[:100]}")
             if action == "click":
                 progress_callback(f"  🖱️ {action} ({x},{y})")
@@ -1562,7 +1590,10 @@ def run_gui_task(task: str,
             action_desc += f" ({x},{y})"
         elif action in ("type", "press", "scroll", "multi_scroll", "page_jump"):
             action_desc += f" \"{text}\""
-        history.append(f"[{iteration+1}] {thought} → {action_desc}")
+        history.append(
+            f"[{iteration+1}] state={state or '-'} | goal={goal or '-'} | "
+            f"strategy={strategy} | attempt={attempt} | {thought} → {action_desc}"
+        )
 
         time.sleep(1.5)
 

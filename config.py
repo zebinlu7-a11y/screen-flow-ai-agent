@@ -9,16 +9,16 @@ from utils.api_key_manager import get_api_key, get_model, get_proxy
 # ============================================================
 # 快捷键
 # ============================================================
-DEFAULT_HOTKEY = "ctrl+d"
-TOGGLE_HOTKEY = "ctrl+f"
-OCR_HOTKEY = "ctrl+r"
-LEETCODE_HOTKEY = "ctrl+k"
+DEFAULT_HOTKEY = "<ctrl>+d"
+TOGGLE_HOTKEY = "<ctrl>+m"
+OCR_HOTKEY = "<ctrl>+r"
+LEETCODE_HOTKEY = "<ctrl>+,"
 
 # ============================================================
 # Ctrl+方向键 鼠标微调（步长：像素）
 # ============================================================
-CURSOR_STEP = 30  # Ctrl+方向键 移动悬浮窗步长(像素)
-QUIT_HOTKEY = "ctrl+q"
+CURSOR_STEP = 20  # Ctrl+方向键 移动悬浮窗步长(像素)
+QUIT_HOTKEY = "<ctrl>+q"
 
 # ============================================================
 # 网络代理（访问火山引擎 API 需要）

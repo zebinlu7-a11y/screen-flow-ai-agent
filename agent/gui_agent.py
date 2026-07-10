@@ -678,7 +678,7 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - "click":    鼠标点击元素 → 同时返回 x, y (归一化坐标 0-1000)
 - "type":     在当前焦点输入框打字 → text="要输入的文字"
 - "press":    按键盘按键 → text="enter" / "ctrl+w" / "alt+f4" / "win+r" / "tab" 等
-- "scroll":   滚动 → text="up" 或 "down"
+- "scroll":   滚动 → text="up"/"down" 或数字如 "-8"/"15"（自己做主判断滚多少）
 - "wait":     等待 → text="2" (秒)
 - "open_url": 在浏览器打开网址 → text="https://www.baidu.com"
               如果需要搜索但没开浏览器，先用 press text="win+r" 打开运行,
@@ -715,7 +715,7 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - drag: 拖拽，必须给 x,y,x2,y2
 - fill: 在坐标处点击后输入文本，必须给 x,y,text
 - hotkey: 键盘或快捷键，必须给 text，例如 enter、ctrl+l、alt+f4、win+r
-- scroll: 在指定区域滚动，最好给 x,y，text 为 up/down/long_down/long_up 或数字
+- scroll: 在指定区域滚动，最好给 x,y，text 为 up/down 或直接写数字（负数下滚，正数上滚，根据截图内容判断幅度，如需要滚半页写 -15）
 - multi_scroll: 一次性大幅滚动，必须给 text 为次数或方向:次数，例如 down:8
 - page_jump: 估算目标页差距后连续翻页，text 为页数差或目标页，例如 9 或 target:10
 - page_down: 向下翻页，不需要 text
@@ -902,31 +902,63 @@ def _pyautogui_hotkey(key: str):
 
 def _pyautogui_scroll(direction: str, x: int = 0, y: int = 0):
     import pyautogui
+    direction = (direction or "down").strip().lower()
+    if direction.lstrip("-").isdigit():
+        amount = int(direction)
+    elif direction in ("down", "roll_down"):
+        amount = -12
+    elif direction in ("long_down", "pagedown", "page_down"):
+        amount = -20
+    elif direction in ("long_up", "pageup", "page_up"):
+        amount = 20
+    else:
+        amount = 12
     try:
-        if x and y:
+        if x > 0 and y > 0:
             pyautogui.moveTo(x, y, duration=0.1)
         else:
             w, h = pyautogui.size()
             pyautogui.moveTo(w // 2, h // 2, duration=0.1)
     except Exception:
         pass
-    direction = (direction or "down").strip().lower()
-    if direction.lstrip("-").isdigit():
-        amount = int(direction)
-    elif direction in ("down", "roll_down"):
-        amount = -8
-    elif direction in ("long_down", "pagedown", "page_down"):
-        amount = -12
-    elif direction in ("long_up", "pageup", "page_up"):
-        amount = 12
-    else:
-        amount = 8
+    print(f"[PyAutoGUI] scroll amount={amount} at=({x},{y})", flush=True)
     pyautogui.scroll(amount)
+    _native_mouse_wheel(amount)
+    # 键盘兜底：文件夹等不响应模拟滚轮，用 PageDown/PageUp 翻页
+    time.sleep(0.15)
+    if amount < 0:
+        count = max(1, abs(amount) // 10)
+        for _ in range(count):
+            pyautogui.press("pagedown")
+            time.sleep(0.05)
+    elif amount > 0:
+        count = max(1, amount // 10)
+        for _ in range(count):
+            pyautogui.press("pageup")
+            time.sleep(0.05)
 
 
-def _pyautogui_page(direction: str):
+def _pyautogui_page(direction: str, x: int = 0, y: int = 0):
     import pyautogui
+    if x > 0 and y > 0:
+        try:
+            pyautogui.moveTo(x, y, duration=0.1)
+            time.sleep(0.05)
+        except Exception:
+            pass
     pyautogui.press("pagedown" if direction == "down" else "pageup")
+
+
+def _native_mouse_wheel(amount: int):
+    if amount == 0:
+        return
+    try:
+        import ctypes
+
+        wheel_delta = int(amount) * 120
+        ctypes.windll.user32.mouse_event(0x0800, 0, 0, wheel_delta, 0)
+    except Exception:
+        pass
 
 
 def _parse_count_text(text: str, default: int = 3, limit: int = 20) -> tuple:
@@ -1452,10 +1484,10 @@ def run_gui_task(task: str,
                 _pyautogui_page_jump(text or "1")
                 text = f"page_jump {text or '1'}"
             elif action == "page_down":
-                _pyautogui_page("down")
+                _pyautogui_page("down", x, y)
                 text = "page down"
             elif action == "page_up":
-                _pyautogui_page("up")
+                _pyautogui_page("up", x, y)
                 text = "page up"
             elif action == "wait":
                 time.sleep(min(float(text or 1), 5))

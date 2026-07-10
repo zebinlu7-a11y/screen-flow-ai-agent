@@ -194,6 +194,8 @@ _cloudflared_proc = None
 
 def start_ngrok_tunnel(port: int, auth_token: str = "") -> Optional[str]:
     global _ngrok_tunnel
+    if os.environ.get("AIRAG_ENABLE_NGROK", "0") != "1":
+        return None
     if not auth_token:
         return None
     try:
@@ -328,10 +330,10 @@ def get_connection_urls(port: int, ngrok_token: str = "") -> list[dict]:
     if ts_ip:
         url = f"http://{ts_ip}:{port}"
         urls.append({"label": f"Tailscale ({ts_ip})", "url": url, "qr_base64": generate_qr_base64(url)})
-    # Try ngrok first, then Cloudflare
-    tunnel_url = start_ngrok_tunnel(port, ngrok_token)
+    # 默认不启动 ngrok，避免弹出 ngrok.exe 窗口；需要时手动设置 AIRAG_ENABLE_NGROK=1
+    tunnel_url = start_cloudflare_tunnel(port)
     if not tunnel_url:
-        tunnel_url = start_cloudflare_tunnel(port)
+        tunnel_url = start_ngrok_tunnel(port, ngrok_token)
     if tunnel_url:
         urls.append({"label": "公网 (任何网络)", "url": tunnel_url, "qr_base64": generate_qr_base64(tunnel_url)})
     return urls

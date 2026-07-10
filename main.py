@@ -498,6 +498,9 @@ class ScreenAIAgent(QObject):
 
         # UI 组件 — ResultWindow 常驻显示（内嵌侧边栏）
         self._result_window = ResultWindow()
+        self._result_window.setWindowFlag(Qt.WindowType.Tool, True)
+        self._result_window.setWindowFlag(Qt.WindowType.Window, False)
+        self._result_window.hide()
         self._result_window.follow_up_requested.connect(self._on_follow_up)
         self._result_window.model_changed.connect(self._on_model_changed)
         self._result_window.settings_requested.connect(self._change_api_key)
@@ -513,6 +516,7 @@ class ScreenAIAgent(QObject):
         )
         self._refresh_sidebar()
         self._result_window.show()
+        self._result_window.hide()
         self._stream_worker: Optional[StreamWorker] = None
         self._capture_win: Optional[CaptureWindow] = None
         self._browser_warmup_thread: Optional[DesktopAgentProcessThread] = None
@@ -559,10 +563,15 @@ class ScreenAIAgent(QObject):
         self._tray = QSystemTrayIcon()
         self._tray.setToolTip("AIRAG 截图助手\nCtrl+D 截图  Ctrl+H 显隐")
 
-        # 使用一个简单的内置图标（没有外部图标文件）
-        pixmap = self._create_tray_icon_pixmap()
-        icon = QIcon(pixmap)
-        self._tray.setIcon(icon)
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "1.ico")
+        if os.path.exists(icon_path):
+            self._tray.setIcon(QIcon(icon_path))
+            self._app.setWindowIcon(QIcon(icon_path))
+        else:
+            # 兜底：没有外部图标文件时继续使用内置图标
+            pixmap = self._create_tray_icon_pixmap()
+            icon = QIcon(pixmap)
+            self._tray.setIcon(icon)
         self._tray.setVisible(True)
 
         # 右键菜单
@@ -694,28 +703,28 @@ class ScreenAIAgent(QObject):
     def _register_hotkey(self):
         """注册全局快捷键 Ctrl+D（截图）和 Ctrl+F（显隐）— 跨平台 pynput。"""
         try:
-            # pynput 热键映射：<ctrl>+d, <ctrl>+f
+            # pynput 热键映射 — 热键字符串从 config.py 读取
             hotkeys = {
-                '<ctrl>+d': self._on_hotkey_triggered,
-                '<ctrl>+f': self._on_hotkey_toggle,
-                '<ctrl>+r': self._on_ocr_hotkey,
-                '<ctrl>+k': self._on_leetcode_hotkey,
-                '<ctrl>+y': self._on_speech_hotkey,
-                '<ctrl>+g': self._on_gui_agent_hotkey,
-                '<ctrl>+q': self._on_quit_hotkey,
-                '<esc>': self._on_esc_hotkey,
+                DEFAULT_HOTKEY:         self._on_hotkey_triggered,
+                TOGGLE_HOTKEY:           self._on_hotkey_toggle,
+                OCR_HOTKEY:              self._on_ocr_hotkey,
+                LEETCODE_HOTKEY:         self._on_leetcode_hotkey,
+                '<ctrl>+y':              self._on_speech_hotkey,
+                '<ctrl>+g':              self._on_gui_agent_hotkey,
+                QUIT_HOTKEY:             self._on_quit_hotkey,
+                '<esc>':                 self._on_esc_hotkey,
             }
             self._hotkey_listener = pynput_keyboard.GlobalHotKeys(
                 hotkeys, suppress=False)  # suppress=False 让 Ctrl+Z 等正常传递
             self._hotkey_listener.start()  # 非阻塞，后台线程运行
             self._hotkey_registered = True
             print(f"[AIRAG] [OK] 快捷键注册成功 (pynput)")
-            print(f"         Ctrl+D — 截图发送")
-            print(f"         Ctrl+R — OCR 文字识别")
-            print(f"         Ctrl+K — LeetCode 编程解答")
-            print(f"         Ctrl+F — 隐藏/显示窗口")
+            print(f"         {DEFAULT_HOTKEY.upper()} — 截图发送")
+            print(f"         {OCR_HOTKEY.upper()} — OCR 文字识别")
+            print(f"         {LEETCODE_HOTKEY.upper()} — LeetCode 编程解答")
+            print(f"         {TOGGLE_HOTKEY.upper()} — 隐藏/显示窗口")
             print(f"         Ctrl+↑↓←→ — 移动悬浮窗 ({CURSOR_STEP}px/步)")
-            print(f"         Ctrl+Q — 退出程序")
+            print(f"         {QUIT_HOTKEY.upper()} — 退出程序")
 
             # Ctrl+方向键用原始按键监听（GlobalHotKeys 不支持组合方向键）
             try:
@@ -914,6 +923,9 @@ class ScreenAIAgent(QObject):
         self._last_user_text = user_text
         self._last_image_b64_list = [image_base64]
         self._last_capture_rect = None  # 不强制重新定位，保持原位
+
+        # 调整窗口为 600×500，以当前窗口左上角为起点
+        self._result_window.resize(600, 500)
 
         self._result_window.show()
         self._result_window.raise_()
@@ -1672,13 +1684,16 @@ def main():
 
     # 设置网络代理（火山引擎 API 需要）
     if HTTP_PROXY:
-        import os
         os.environ["HTTP_PROXY"] = HTTP_PROXY
         os.environ["HTTPS_PROXY"] = HTTP_PROXY
         print(f"   Proxy:      {HTTP_PROXY}")
     print()
 
     app = QApplication(sys.argv)
+    app.setApplicationName("Ai_Flow")
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "1.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     app.setQuitOnLastWindowClosed(False)
 
     # 检查是否支持系统托盘

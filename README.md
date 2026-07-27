@@ -5,7 +5,7 @@
 <h2 align="center">Ai_Flow — 智能远程桌面AI助手</h2>
 
 <p align="center">
-  <b>截图+AI 流式对话 · ReAct 桌面自动化 · 手机远程控制 · 长期记忆 · 隐私保护</b>
+  <b>截图+AI 流式对话 · ReAct 桌面自动化 · 手机远程控制 · 长期记忆 · 安全 Harness · 隐私保护</b>
 </p>
 
 ---
@@ -16,13 +16,14 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 内置 **ReAct GUI Agent**——纯视觉决策引擎，AI 看截图自己决定下一步该点哪里、敲什么。输入自然语言即可自动操作桌面和浏览器：打开软件、搜索网页、填写表单、点击按钮，完全模拟人类操作。
 
-支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**多层记忆系统**让 AI 记住你是谁、你在做什么项目、你的偏好。**MCP 浏览器自动化**让你操控浏览器像操控本地应用一样自然。
+支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**多层记忆系统**让 AI 记住你是谁、你在做什么项目、你的偏好。**MCP 浏览器自动化**让你操控浏览器像操控本地应用一样自然。**安全 Harness** 为远程指令提供风险评估、确认门禁、审计追踪和回滚方案，高危操作需手机端二次确认才执行。
 
 - **纯文本对话** — 悬浮窗底部输入框打字，Enter 发送
 - **截图提问** — `Ctrl+D` 连续截图，缩略图累积，点发送统一提交
 - **OCR 识别** — `Ctrl+R` 截图，腾讯云 OCR 识别返回可复制文字
 - **桌面自动化** — `Ctrl+G` 或输入 `自动 任务`，ReAct Agent 自动操作桌面/浏览器
 - **手机远程控制** — 手机浏览器扫码，实时看截图+发指令+控制 PC
+- **安全 Harness** — 远程指令风险评估 + 确认门禁 + 审计追踪 + 回滚方案
 - **浏览器自动化** — Playwright MCP Server + CDP 双引擎，自动打开网页操作
 - **语音输入** — `Ctrl+Y` 实时语音转文字，滚轮选句子，AI问答
 
@@ -85,6 +86,11 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 | **手机远程** | 实时截图 | 每 1.5s 自动推送，降采样 720px + JPEG 50% 省流量 |
 | | 多轮任务 | 子进程常驻模式，手机连续发指令不复启动 |
 | | 多种穿透 | 局域网 IP + Tailscale + ngrok + Cloudflare Tunnel，自动生成二维码 |
+| **安全 Harness** | 风险评估 | 基于关键词 + 否定句式检测，三级分类（安全/高风险/关键），区分"如何删除"和"删除文件" |
+| | 确认门禁 | 高风险指令需手机端二次确认；关键指令（支付/转账/格式化）直接拦截阻断 |
+| | 审计追踪 | JSONL 格式记录每条指令的完整生命周期（风险评估→确认响应→执行路径→结果） |
+| | 回滚方案 | 高风险操作提供替代方案（回收站删除/先备份再删/取消），一键改写指令 |
+| | 直达命令 | 简单操作（打开QQ/切换到微信/锁屏/关机）绕过 Agent 直接执行，毫秒级响应 |
 | **记忆系统** | 短期记忆 | 最近 3 轮对话原文，直接拼入 prompt |
 | | 中期记忆 | 超出 3 轮的消息索引进 BM25 向量库，语义搜索 Top-K 注入上下文 |
 | | 长期记忆 | 对话结束后 AI 自动提炼用户事实，FAISS 语义检索 + 关键词回退 |
@@ -134,8 +140,10 @@ ReAct Loop (最多 15 步):
 |------|------|
 | **纯视觉定位** | 模型直接看截图返回归一化坐标 (0-1000)，`pixel = normalized * img_dim / 1000` |
 | **ReAct 范式** | 每步观察→思考→行动，AI 动态决策，不依赖预定义步骤 |
-| **多种动作** | click / double / right / move / drag / fill / hotkey / scroll / wait |
-| **安全机制** | ESC 立即终止、最大 15 步、连续 3 次相同动作自动退出、`Alt+F4` 智能拦截 |
+| **20+ 种动作** | click / double / right / move / drag / fill / hotkey / scroll / type / press / wait / alt_tab / focus_window / open_url / observe_browser / zoom / maximize / read_page / page_up / page_down / multi_scroll / ask_user |
+| **鼠标定位** | 三层兜底：pyautogui.moveTo → ctypes SetCursorPos → SendInput (MOUSEEVENTF_ABSOLUTE) |
+| **输出校验** | Pydantic 级 JSON 校验，无效动作/坐标越界自动抛错触发 LLM 重试 |
+| **安全机制** | ESC 立即终止、最大 15 步、连续 3 次相同动作自动退出、`Alt+F4` 智能拦截、动作执行前二次取消检查 |
 | **进程隔离** | Agent 跑在独立子进程，崩溃不影响 UI，方便取消和资源回收 |
 
 ## 手机远程控制
@@ -160,6 +168,61 @@ ReAct Loop (最多 15 步):
 - 🛑 **远程取消** — 点取消按钮 = PC 按 ESC
 - 📊 **进度日志** — 实时显示 ReAct 每一步的执行状态
 - 🔄 **多轮复用** — 子进程保持不退出，连续发指令无需重新初始化浏览器
+
+## 安全 Harness — 远程控制安全防护
+
+手机远程控制场景下，每条指令都经过多层安全检测，确保危险操作不会静默执行。
+
+### 架构
+
+```
+手机指令 → 取消/停止? ──→ 直接取消
+        → 直达命令?   ──→ 设备端直接执行 (锁屏/关机/截图/休眠)
+        → 风险评估 ──→ safe     → 正常发送给 Agent
+                    → high     → 手机端弹确认面板 + 替代方案
+                    → critical → 直接阻断 (支付/转账/格式化)
+```
+
+### 风险评估
+
+基于规则引擎的三级分类，内置否定句式检测——区分"如何删除文件"（学习意图）和"删除文件"（危险操作）：
+
+| 级别 | 示例 | 处理 |
+|------|------|------|
+| 🟢 safe | "打开百度"、"搜索Python" | 直接执行 |
+| 🟠 high | "删除桌面文件"、"卸载软件" | 手机端弹窗确认 + 替代方案 |
+| 🔴 critical | "转账"、"支付"、"格式化D盘" | 直接阻断，显示原因 |
+
+### 确认面板
+
+高风险指令被拦截后，手机端弹出确认面板：
+
+- 📋 显示原始指令和风险原因
+- 🔄 提供替代方案（回收站删除 / 先备份 / 取消操作）
+- ⏰ 2 分钟超时自动取消
+- 📝 完整审计记录
+
+<img src="assets/user5.png" alt="手机远程控制" width="220">
+
+### 审计日志
+
+每条远控指令以 JSONL 格式记录完整生命周期，线程安全追加写入：
+
+```jsonl
+{"id":"a1b2c3","timestamp":"2026-07-27T14:30:00","command_text":"删除桌面文件","risk_level":"high","confirmation_requested":true,"confirmation_response":"confirmed","execution_path":"agent","session_id":"abc123"}
+{"id":"d4e5f6","timestamp":"2026-07-27T14:35:00","command_text":"转账100元到xxx","risk_level":"critical","confirmation_requested":true,"confirmation_response":"blocked","execution_path":"blocked","session_id":"abc123"}
+```
+
+### 直达命令
+
+简单操作不走 Agent，绕过 AI 决策直接执行，毫秒级响应：
+
+- `锁屏` / `关机` / `休眠` / `重启`
+- `截图` / `打开QQ` / `切换到微信`
+- `音量加` / `音量减` / `静音`
+- `亮度+` / `亮度-`
+
+含"然后"、"接着"、"帮我把"等复合标记的指令不会被直达系统拦截，自动路由给 Agent 处理。
 
 ## 快速上手
 
@@ -206,7 +269,7 @@ pyinstaller打包压缩成ZIP，解压双击 `Ai_Flow.exe` 运行。
 │  main.py                        Qt 主进程 + 悬浮窗              │
 │  ├─ 对话:   StreamWorker → LangGraph → 豆包 VL 流式输出        │
 │  ├─ 自动化: DesktopAgentProcessThread → 子进程 → ReAct Agent  │
-│  └─ 远程:   RemoteServer → HTTP API → 手机浏览器控制           │
+│  └─ 远程:   RemoteServer → HTTP API → 安全 Harness → 手机控制  │
 ├──────────────────────────────────────────────────────────────┤
 │  agent/                          AI 核心                       │
 │  ├─ gui_agent.py       ReAct Agent + MCP 浏览器 + Loop Engineer│
@@ -225,7 +288,13 @@ pyinstaller打包压缩成ZIP，解压双击 `Ai_Flow.exe` 运行。
 │                                      │  ├─ context_store.py    │
 │  remote/             手机远程        │  ├─ user_manager.py     │
 │  ├─ server.py        HTTP API       │  ├─ api_key_manager.py  │
-│  └─ phone.html       手机界面       │  └─ token_counter.py    │
+│  └─ phone.html       手机界面+Harness│  ├─ token_counter.py    │
+│                                      │  ├─ risk_engine.py 🔒   │
+│                                      │  ├─ audit_store.py 📋   │
+│                                      │  ├─ rollback.py    ↩️    │
+│                                      │  ├─ direct_commands.py ⚡│
+│                                      │  ├─ task_router.py  🔀  │
+│                                      │  └─ app_control.py  🪟  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -254,8 +323,8 @@ AIRAG/
 │   └── input_widget.py         # 截图后快捷输入弹窗
 │
 ├── remote/                     # 手机远程控制
-│   ├── server.py               # HTTP API 服务 (aiohttp) + Cloudflare Tunnel + QR 码
-│   └── phone.html              # 手机端界面 (深色主题, 响应式, 轮询截图)
+│   ├── server.py               # HTTP API 服务 (aiohttp) + 安全 Harness + Cloudflare Tunnel + QR 码
+│   └── phone.html              # 手机端界面 (深色主题, 响应式, 确认面板, 提示栏)
 │
 ├── utils/                      # 工具库
 │   ├── image_tool.py           # QImage ↔ PIL ↔ base64 转换 + 压缩
@@ -269,7 +338,23 @@ AIRAG/
 │   ├── vector_store.py         # FAISS + TF-IDF 向量存储引擎
 │   ├── retrieval_ranker.py     # RRF 融合 + lightweight rerank 精排
 │   ├── gui_operation_memory.py # GUI 操作历史记忆
-│   └── session_memory.py       # 会话记忆管理
+│   ├── session_memory.py       # 会话记忆管理
+│   ├── app_control.py          # 🪟 Windows 应用发现/激活/启动 (40+ 应用)
+│   ├── direct_commands.py      # ⚡ 直达命令路由 (纯启动/切换绕过 Agent)
+│   ├── task_router.py          # 🔀 任务分类路由 (embedding 语义相似度)
+│   ├── risk_engine.py          # 🔒 风险评估引擎 (safe/high/critical)
+│   ├── audit_store.py          # 📋 审计日志存储 (JSONL + 线程安全)
+│   └── rollback.py             # ↩️ 回滚方案 + 替代操作建议
+│
+├── tests/                      # 测试套件
+│   ├── test_risk_engine.py
+│   ├── test_audit_store.py
+│   ├── test_task_router.py
+│   ├── test_app_control.py
+│   ├── test_server_harness.py
+│   └── test_scroll_drag.py
+│
+├── pyproject.toml              # 项目配置 + pytest 设置
 │
 └── assets/                     # 截图和图标
     ├── logo.png
@@ -295,6 +380,8 @@ AIRAG/
 | 向量存储 | FAISS IndexFlatIP + TF-IDF + jieba 分词 |
 | 长期记忆 | LLM 后台提取事实 → Jaccard 去重 → FAISS 索引 → 注入 prompt |
 | 远程控制 | aiohttp HTTP API + 轮询 + Cloudflare Tunnel / ngrok / Tailscale |
+| 安全 Harness | 规则引擎风险评估 + 确认门禁 + JSONL 审计日志 + 回滚方案 + 直达命令路由 |
+| 任务路由 | sentence-transformers (BGE-small-zh-v1.5) 语义相似度 + 规则引擎复合检测 |
 | 语音识别 | PyAudio 实时录音 + 腾讯云 ASR，VAD 音量阈值断句 |
 | OCR | 腾讯云 GeneralBasicOCR，1000 次/月免费额度 |
 | 打包 | PyInstaller onedir 模式 |
@@ -306,7 +393,7 @@ AIRAG/
             ├─ QThread: StreamWorker       asyncio 协程 → 流式对话
             ├─ QThread: DesktopAgentThread  stdout 管道 → 管理子进程
             ├─ QThread: MemWorker          同步阻塞 → 长期记忆提取
-            └─ 守护线程: RemoteServer       aiohttp 协程 → 手机 HTTP API
+            └─ 守护线程: RemoteServer       aiohttp 协程 → HTTP API + 安全 Harness
 
 1 个子进程 ─── python run_gui_agent.py     同步阻塞 → ReAct Agent 执行
 ```
@@ -319,7 +406,7 @@ AIRAG/
 | StreamWorker | QThread #2 | asyncio 协程 | 流式对话: 记忆检索 → 豆包 VL 逐 token | `pyqtSignal(token)` |
 | DesktopAgentThread | QThread #3 | stdout 管道同步读 | 子进程管理: 启动、读进度、读结果 | `pyqtSignal(msg)` |
 | MemWorker | QThread #4 | 同步阻塞 | LLM 提取事实 → 去重 → FAISS | `pyqtSignal(facts)` |
-| RemoteServer | 守护线程 #5 | aiohttp 协程 | HTTP API: 轮询/发指令/取消 | 变量写入 + `threading.Lock` |
+| RemoteServer | 守护线程 #5 | aiohttp 协程 | HTTP API: 轮询/风险评估/确认门禁/审计记录 | 变量写入 + `threading.Lock` |
 | 截图推送线程 | 守护线程 #6 | threading.Thread | 每 1.5s 截图推给手机 | `RemoteServer.set_screenshot()` |
 | pynput 线程 | 后台线程 | pynput 内部 threading | 全局热键监听 | `QTimer.singleShot(0, cb)` |
 | **子进程** | **独立进程** | **同步阻塞** | **ReAct: 截图→决策→执行→循环** | stdout 管道 + JSON 文件 |

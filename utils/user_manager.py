@@ -80,10 +80,14 @@ def load_conversation(user_id: str, conv_id: str) -> Optional[dict]:
 
 
 def delete_conversation(user_id: str, conv_id: str):
-    """删除对话文件。"""
+    """删除对话文件，同步清理活跃对话追踪。"""
     filepath = os.path.join(get_conv_dir(user_id), f"{conv_id}.json")
     if os.path.exists(filepath):
         os.remove(filepath)
+    # 如果删的是当前活跃对话，清除追踪
+    active_id = get_active_conversation_id()
+    if active_id == conv_id:
+        set_active_conversation_id(user_id, "")
 
 
 def list_conversations(user_id: str) -> List[dict]:

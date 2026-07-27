@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 透明悬浮结果窗 — 流式显示 AI 回复，支持 Markdown、拖动、缩放。
 
@@ -49,6 +49,12 @@ class ResultWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._buffer = ""
+        self._idle_html = (
+            "<div style='padding:28px 18px;text-align:center;color:#56637a;'>"
+            "<div style='font-size:18px;font-weight:600;margin-bottom:8px;'>准备就绪</div>"
+            "<div style='font-size:12px;'>等待任务输入</div>"
+            "</div>"
+        )
         self._pending_images: list = []    # 待发送图片 (base64 列表)
         self._pending_qimgs: list = []    # 待发送图片 (QImage 列表，供复制用)
         self._thumb_widgets: list = []    # 缩略图 widget 列表
@@ -281,6 +287,7 @@ class ResultWindow(QWidget):
         """)
         self._text_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self._text_view, stretch=1)
+        self._text_view.setHtml(self._idle_html)
 
         # ---- 语音识别区 ----
         # 语音状态行：状态文字 + 发送按钮
@@ -593,7 +600,15 @@ class ResultWindow(QWidget):
 
     def clear_content(self):
         self._buffer = ""
-        self._text_view.clear()
+        self._text_view.setHtml(self._idle_html)
+
+    def show_normal(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def hide_normal(self):
+        self.hide()
 
     def get_content(self) -> str:
         return self._buffer

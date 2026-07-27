@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """AIRAG 打包脚本 — 运行此脚本生成 exe"""
+import os
 import sys
 sys.setrecursionlimit(10000)
 
@@ -27,14 +28,16 @@ EXCLUDES = [
     'mmengine', 'mmcv', 'mmdet',
     'litellm', 'langchain', 'langchain_community', 'tqdm',
     'paddleocr', 'paddlepaddle', 'rich',
-    'aiohttp', 'aiosignal', 'frozenlist', 'yarl', 'multidict',
+    # 'aiohttp', 'aiosignal', 'frozenlist', 'yarl', 'multidict',  # 远程服务需要 aiohttp
 ]
 
 HIDDEN_IMPORTS = [
     'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
     'pynput', 'pynput.keyboard', 'pynput._util',
-    'pyautogui',
-    'PIL', 'PIL.Image',
+    'pyautogui', 'pyscreeze', 'pyperclip',
+    'PIL', 'PIL.Image', 'PIL.ImageGrab',
+    'aiohttp', 'aiohttp.web', 'aiosignal', 'frozenlist', 'yarl', 'multidict',
+    'qrcode',
     'pydantic', 'pydantic.deprecated', 'pydantic.decorators',
     'asyncio', 'typing_extensions',
     'langgraph', 'langgraph.graph', 'langgraph.checkpoint',
@@ -49,10 +52,12 @@ HIDDEN_IMPORTS = [
 
 args = [
     '--onedir',
-    '--name', 'AIRAG',
-    '--console',
+    '--name', 'AIflow',
+    '--windowed',
     '--noconfirm',
     '--clean',
+    '--icon', r'F:\AIRAG\1.ico',
+    '--add-data', 'remote/phone.html{0}remote'.format(os.pathsep),
 ]
 
 for h in HIDDEN_IMPORTS:

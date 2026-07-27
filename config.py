@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 """
 AIRAG 全局配置文件
 """
@@ -37,12 +38,9 @@ DOUBAO_MODEL_NAME = get_model() or os.environ.get("DOUBAO_MODEL_NAME", "doubao-s
 EMBEDDING_MODEL_NAME = os.environ.get("AIRAG_EMBEDDING_MODEL_NAME", "doubao-embedding-text-240715")
 EMBEDDING_ENABLED = os.environ.get("AIRAG_EMBEDDING_ENABLED", "1") != "0"
 
-# GUI 自动化子进程解释器。主界面需要 PyQt/pynput，自动化进程优先使用 browser-use 环境。
-_BROWSER_USE_PYTHON = r"E:\Anaconda3\envs\browser-use\python.exe"
-GUI_AGENT_PYTHON = (
-    os.environ.get("AIRAG_GUI_AGENT_PYTHON")
-    or (_BROWSER_USE_PYTHON if os.path.exists(_BROWSER_USE_PYTHON) else "")
-)
+# GUI 自动化子进程解释器。默认与主进程共用同一环境。
+# 如需指定独立环境: 设置环境变量 AIRAG_GUI_AGENT_PYTHON=路径
+GUI_AGENT_PYTHON = os.environ.get("AIRAG_GUI_AGENT_PYTHON") or ""
 
 # ============================================================
 # Playwright MCP Server 配置
@@ -74,6 +72,10 @@ MODEL_OPTIONS_DEFAULT = "mini (轻量)"  # 默认选中项
 # 远程控制
 # ============================================================
 REMOTE_PORT = 8765
+# 公网固定地址：留空=自动 tunnel，填了直接跳过 tunnel。
+# 例如 ngrok 固定域名: https://xxx.ngrok-free.app
+REMOTE_PUBLIC_URL = os.environ.get("AIRAG_REMOTE_PUBLIC_URL", "")
+SHOW_TRAY_ICON = os.environ.get("AIRAG_SHOW_TRAY_ICON", "0") == "1"
 NGROK_AUTH_TOKEN = ""  # ngrok 在中国不稳定, 留空跳过。跨网用手机热点。
 
 # ============================================================

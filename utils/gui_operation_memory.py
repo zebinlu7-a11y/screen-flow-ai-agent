@@ -1,17 +1,14 @@
-# -*- coding: utf-8 -*-
-"""
-Persistent operation memory for GUI/ReAct automation.
+"""Persistent operation memory for GUI/ReAct automation."""
 
-It stores a compact per-window workflow summary so follow-up remote commands can
-continue from the current desktop/application state.
-"""
+from __future__ import annotations
+
 import json
 import os
 import time
 from datetime import datetime
 from typing import List
 
-from utils.user_manager import get_user_dir, _ensure_dir
+from utils.user_manager import _ensure_dir, get_user_dir
 
 
 def _safe_name(value: str) -> str:
@@ -26,26 +23,25 @@ def _path(user_id: str, memory_key: str) -> str:
 
 
 def load_operation_memory(user_id: str, memory_key: str) -> dict:
+    empty = {
+        "user_id": user_id,
+        "memory_key": memory_key,
+        "summary": "",
+        "recent_steps": [],
+        "last_result": {},
+        "updated": "",
+    }
     path = _path(user_id, memory_key)
     if not os.path.exists(path):
-        return {
-            "user_id": user_id,
-            "memory_key": memory_key,
-            "summary": "",
-            "recent_steps": [],
-            "updated": "",
-        }
+        return empty
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        data.setdefault("last_result", {})
+        data.setdefault("recent_steps", [])
+        return data
     except Exception:
-        return {
-            "user_id": user_id,
-            "memory_key": memory_key,
-            "summary": "",
-            "recent_steps": [],
-            "updated": "",
-        }
+        return empty
 
 
 def save_operation_memory(user_id: str, memory_key: str, memory: dict) -> None:
@@ -60,75 +56,42 @@ def build_operation_context(user_id: str, memory_key: str, query: str = "") -> s
     memory = load_operation_memory(user_id, memory_key)
     lines = []
     if memory.get("summary"):
-        lines.append("## 当前操作窗口历史流程")
+        lines.append("## operation history summary")
         lines.append(memory["summary"])
+
+    last_result = memory.get("last_result") or {}
+    if last_result:
+        lines.append("## last result")
+        lines.append(f"- success: {last_result.get('success', False)}")
+        if last_result.get("transfer_state"):
+            lines.append(f"- transfer_state: {last_result.get('transfer_state')}")
+
     recent_steps = memory.get("recent_steps") or []
     if recent_steps:
-        lines.append("最近操作:")
+        lines.append("## recent operations")
         for step in recent_steps[-8:]:
             lines.append(f"- {step}")
 
-    try:
-        from utils.vector_store import get_conversation_vector_store
-
-        store = get_conversation_vector_store()
-        sparse = store.search(query or memory_key, top_k=3)
-        dense = store.search_dense(query or memory_key, top_k=3)
-        seen = set()
-        retrieved = []
-        for doc_id, text, _ in sparse + dense:
-            if doc_id in seen or not doc_id.startswith(f"guiop:{_safe_name(memory_key)}:"):
-                continue
-            seen.add(doc_id)
-            retrieved.append(text)
-        if retrieved:
-            lines.append("相关历史检索:")
-            for text in retrieved[:3]:
-                lines.append(f"- {text[:300]}")
-    except Exception as exc:
-        print(f"[GuiOpMemory] retrieval skipped: {exc}")
+    if query.strip():
+        lines.append("## current query")
+        lines.append(query.strip())
 
     return "\n".join(lines).strip()
 
 
 def summarize_operation(task: str, history: List[str], audit: dict, previous_summary: str = "") -> str:
     recent = "\n".join(history[-12:])
-    status = "成功" if audit.get("success") else "未完成"
-    reason = audit.get("reason", "")
-    fallback = (
-        f"上一轮任务: {task}\n"
-        f"结果: {status}。{reason[:300]}\n"
-        f"已有流程: {previous_summary[:500]}\n"
-        f"最近步骤:\n{recent[:1200]}"
-    )
-    try:
-        from agent.llm_client import ChatDoubaoVL
-        from langchain_core.messages import HumanMessage
-
-        prompt = f"""请把桌面自动化操作历史压缩成一段简短流程记忆，用于下一轮继续操作。
-要求:
-1. 只保留当前打开了什么窗口/文件/网页、做到哪一步、下一步应注意什么。
-2. 不要超过 180 字。
-3. 如果失败，说明失败点和已尝试方法。
-
-已有流程:
-{previous_summary}
-
-本轮任务: {task}
-审计结果: {status}。{reason}
-最近步骤:
-{recent}
-
-输出流程记忆:"""
-        llm = ChatDoubaoVL(model_name="doubao-seed-2-0-mini-260428")
-        response = llm.invoke([HumanMessage(content=prompt)])
-        text = response.content if hasattr(response, "content") else ""
-        text = str(text).strip()
-        if text:
-            return text[:500]
-    except Exception as exc:
-        print(f"[GuiOpMemory] LLM summary skipped: {exc}")
-    return fallback[-1800:]
+    status = "success" if audit.get("success") else "incomplete"
+    reason = (audit.get("reason") or "")[:300]
+    transfer_state = audit.get("transfer_state", "")
+    transfer_line = f"transfer_state: {transfer_state}\n" if transfer_state else ""
+    return (
+        f"previous task: {task}\n"
+        f"result: {status}. {reason}\n"
+        f"{transfer_line}"
+        f"existing flow: {previous_summary[:500]}\n"
+        f"recent steps:\n{recent[:1200]}"
+    )[:1800]
 
 
 def update_operation_memory(user_id: str, memory_key: str, task: str, history: List[str], audit: dict) -> dict:
@@ -138,6 +101,11 @@ def update_operation_memory(user_id: str, memory_key: str, task: str, history: L
     recent_steps.extend(history[-10:])
     memory["summary"] = summary
     memory["recent_steps"] = recent_steps[-30:]
+    memory["last_result"] = {
+        "success": bool(audit.get("success")),
+        "reason": audit.get("reason", ""),
+        "transfer_state": audit.get("transfer_state", ""),
+    }
     save_operation_memory(user_id, memory_key, memory)
 
     try:

@@ -16,7 +16,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 
 内置 **ReAct GUI Agent**——纯视觉决策引擎，AI 看截图自己决定下一步该点哪里、敲什么。输入自然语言即可自动操作桌面和浏览器：打开软件、搜索网页、填写表单、点击按钮，完全模拟人类操作。
 
-支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**多层记忆系统**让 AI 记住你是谁、你在做什么项目、你的偏好。**MCP 浏览器自动化**让你操控浏览器像操控本地应用一样自然。**安全 Harness** 为远程指令提供风险评估、确认门禁、审计追踪和回滚方案，高危操作需手机端二次确认才执行。
+支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**RAG 驱动的多层记忆系统**（检索增强生成）让 AI 记住你是谁、你在做什么项目、你的偏好——BM25+语义双路召回 → RRF 融合 → rerank 精排 → 注入 prompt。**MCP 浏览器自动化**让你操控浏览器像操控本地应用一样自然。**安全 Harness** 为远程指令提供风险评估、确认门禁、审计追踪和回滚方案，高危操作需手机端二次确认才执行。
 
 - **纯文本对话** — 悬浮窗底部输入框打字，Enter 发送
 - **截图提问** — `Ctrl+D` 连续截图，缩略图累积，点发送统一提交
@@ -73,7 +73,7 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 | **AI 引擎** | 多模态理解 | 豆包 VL，支持多图 + 文字混合输入，最懂中文 |
 | | 流式输出 | 逐字显示，Markdown 渲染（表格 / 代码块 / 标题 / 粗斜体 / 列表） |
 | | 模型切换 | mini / lite / pro 三档随时切换，省成本或追求质量 |
-| | 三层记忆 | 短期最近 3 轮原文 + 中期会话历史 BM25 检索 + 长期跨越会话的用户画像 |
+| | RAG 三层记忆 | 短期 3 轮原文 + 中期 BM25+语义检索 + 长期 FAISS 向量库（Embedding → Retrieve → Rerank → Augment） |
 | **GUI 自动化** | ReAct 循环 | 截图 → AI 看图思考 → 返回动作坐标 → pyautogui 执行 → 再看效果 |
 | | 纯视觉定位 | 模型直接看截图返回归一化坐标 (0-1000)，无需 DOM/无障碍 API |
 | | 15 步循环 | 每步 1.5s 间隔，最多 15 轮，连续 3 次相同动作自动退出防死循环 |
@@ -91,10 +91,10 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 | | 审计追踪 | JSONL 格式记录每条指令的完整生命周期（风险评估→确认响应→执行路径→结果） |
 | | 回滚方案 | 高风险操作提供替代方案（回收站删除/先备份再删/取消），一键改写指令 |
 | | 直达命令 | 简单操作（打开QQ/切换到微信/锁屏/关机）绕过 Agent 直接执行，毫秒级响应 |
-| **记忆系统** | 短期记忆 | 最近 3 轮对话原文，直接拼入 prompt |
-| | 中期记忆 | 超出 3 轮的消息索引进 BM25 向量库，语义搜索 Top-K 注入上下文 |
-| | 长期记忆 | 对话结束后 AI 自动提炼用户事实，FAISS 语义检索 + 关键词回退 |
-| | 检索精排 | RRF 双路融合 + lightweight rerank 精排 |
+| **RAG 记忆系统** | Embedding | `doubao-embedding-text-240715` 文本向量化，FAISS IndexFlatIP 内积索引 |
+| | Retrieval | 三路召回：BM25 关键词 + 语义向量 + jieba 分词关键词 |
+| | Rerank | RRF 双路融合 + lightweight rerank 精排，Top-K 注入 prompt |
+| | Augment | 长期记忆：LLM 后台提取事实 → Jaccard 去重 → FAISS 语义检索 → System Prompt |
 | **语音 & OCR** | 语音输入 | PyAudio 实时录音 + 腾讯云 ASR，静默 0.8s 自动断句，滚轮选句子 |
 | | OCR 识别 | 腾讯云 GeneralBasicOCR，1000 次/月免费，批量多区域识别 |
 | **隐私 & 设置** | 隐私保护 | `SetWindowDisplayAffinity(0x11)` 防屏幕捕获，截图/录屏/会议看不到悬浮窗 |
@@ -376,9 +376,10 @@ AIRAG/
 | 状态机 | **LangGraph** StateGraph + MemorySaver 检查点 |
 | 浏览器控制 | **MCP** (Model Context Protocol) JSON-RPC 2.0 over stdio + Playwright CDP 兜底 |
 | 桌面操作 | pyautogui（鼠标/键盘），pyperclip（剪贴板粘贴） |
-| 记忆检索 | BM25 + 关键词双路召回 → RRF 融合 → lightweight rerank 精排 |
+| RAG 检索 | BM25 + 语义向量 + jieba 三路召回 → RRF 融合 → lightweight rerank 精排 → 注入 prompt |
+| Embedding | `doubao-embedding-text-240715`（dense retrieval）+ `BGE-small-zh-v1.5`（任务路由语义匹配） |
 | 向量存储 | FAISS IndexFlatIP + TF-IDF + jieba 分词 |
-| 长期记忆 | LLM 后台提取事实 → Jaccard 去重 → FAISS 索引 → 注入 prompt |
+| 长期记忆 | LLM 后台提取事实 → Jaccard 去重 → FAISS 索引 → 注入 System Prompt |
 | 远程控制 | aiohttp HTTP API + 轮询 + Cloudflare Tunnel / ngrok / Tailscale |
 | 安全 Harness | 规则引擎风险评估 + 确认门禁 + JSONL 审计日志 + 回滚方案 + 直达命令路由 |
 | 任务路由 | sentence-transformers (BGE-small-zh-v1.5) 语义相似度 + 规则引擎复合检测 |
@@ -421,15 +422,36 @@ AIRAG/
 | 跨线程通信用 Qt 信号槽 | Qt 自动深拷贝数据到目标线程队列，不加锁 |
 | pynput 线程不碰 UI | 热键回调在 pynput 线程，`QTimer.singleShot(0, cb)` 安全切回主线程 |
 
-## 记忆系统
+## RAG 记忆系统（检索增强生成）
 
-三层记忆架构，让 AI 既知道"正在聊什么"，也记得"你是谁"：
+标准 RAG (Retrieval-Augmented Generation) 管道驱动三层记忆，让 AI 既知道"正在聊什么"，也记得"你是谁"：
 
-| 层级 | 数据来源 | 生命周期 | 检索方式 |
-|------|---------|---------|---------|
-| **短期** | 最近 3 轮对话原文 | 当前会话 | 直接拼入 prompt，不检索 |
-| **中期** | 3 轮之前的对话消息 | 当前会话 | BM25+语义 → RRF 融合 → rerank 精排 |
-| **长期** | AI 提炼的用户事实 (身份/偏好/项目/问题/知识) | 跨会话永久 | 语义 + 关键词双路 → RRF → rerank → 注入 prompt |
+```
+用户消息
+  │
+  ├─ 短期记忆: 最近 3 轮原文 ──────────→ 直接拼入 prompt（Retrieve-free）
+  │
+  ├─ 中期记忆: 历史消息
+  │   ├─ BM25 关键词召回 ──┐
+  │   ├─ 语义向量召回     ──┼─→ RRF 融合 → rerank 精排 → Top-K 注入
+  │   └─ jieba 分词召回   ──┘
+  │
+  └─ 长期记忆: 用户事实
+      ├─ Embedding: doubao-embedding-text-240715
+      ├─ Index: FAISS IndexFlatIP
+      └─ Semantic search → Top-K 注入 System Prompt
+```
+
+| 管道阶段 | 短期 | 中期 | 长期 |
+|----------|------|------|------|
+| **Source** | 最近 3 轮对话原文 | 当前会话历史消息 | LLM 提炼的用户事实 (身份/偏好/项目/知识) |
+| **Chunking** | 不分割 | 按消息边界 | 按事实条目 |
+| **Embedding** | 不需要 | doubao-embedding-text-240715 | doubao-embedding-text-240715 |
+| **Index** | 不需要 | 内存 BM25 + FAISS | FAISS IndexFlatIP 持久化 |
+| **Retrieval** | 直接拼接 (Retrieve-free) | BM25 + 语义 + jieba 三路召回 | 语义 + 关键词双路召回 |
+| **Fusion & Rerank** | 不需要 | RRF 融合 → lightweight rerank | RRF 融合 → lightweight rerank |
+| **Augment** | 拼入 System Prompt | Top-K 注入上下文 | Top-K 注入 System Prompt |
+| **Lifecycle** | 当前会话 | 当前会话 | 跨会话永久 |
 
 长期记忆在对话结束后由后台 `MemWorker` 异步提取，不阻塞用户操作。
 

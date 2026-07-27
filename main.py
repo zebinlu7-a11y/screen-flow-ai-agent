@@ -1,4 +1,4 @@
-"""
+﻿"""
 AIRAG — 智能截图解析悬浮窗工具 主入口
 
 流程：
@@ -257,23 +257,35 @@ class _RemoteAgentThread(QThread):
     done = pyqtSignal(bool, str)
 
     def __init__(self, task: str, remote_server, use_mcp: bool = False,
-                 user_id: str = "default", memory_key: str = "remote_desktop"):
+                 user_id: str = "default", memory_key: str = "remote_desktop",
+                 is_continuation: bool = False):
         super().__init__()
         self._task = task
+        self._is_continuation = is_continuation
         self._use_mcp = use_mcp
         self._remote = remote_server
         self._user_id = user_id
         self._memory_key = memory_key
         self._proc = None
         self._cancel_file = ""
+        self._hint_file = ""
         self._stop_event = threading.Event()
-        # 多轮任务队列 (线程安全)
         import queue
         self._task_queue = queue.Queue()
+        self._last_task = task
+        self._last_task_time = time.time()
 
     def send_task(self, task: str):
-        """发送新任务给正在运行的 Agent (线程安全)."""
-        self._task_queue.put(task)
+        from utils.task_router import classify_task
+        now = time.time()
+        task_type = classify_task(
+            task, previous_task=self._last_task,
+            time_since_last=now - self._last_task_time,
+        )
+        is_cont = (task_type == "related_task")
+        self._last_task = task
+        self._last_task_time = now
+        self._task_queue.put((task, is_cont))
 
     def stop_agent(self):
         """停止 Agent."""
@@ -325,8 +337,11 @@ class _RemoteAgentThread(QThread):
         if self._use_mcp:
             cmd.append("--mcp")
         cmd.extend(["--cancel-file", self._cancel_file])
+        cmd.extend(["--hint-file", self._hint_file])
         cmd.extend(["--user-id", self._user_id or "default"])
         cmd.extend(["--memory-key", self._memory_key or "remote_desktop"])
+        if self._is_continuation:
+            cmd.append("--is-continuation")
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -350,11 +365,16 @@ class _RemoteAgentThread(QThread):
                 continue
 
             if next_task is None:
-                break  # stop signal
+                break
 
-            # 发送任务到子进程
+            if isinstance(next_task, tuple):
+                next_task, is_cont = next_task
+            else:
+                is_cont = False
+
             try:
-                self._proc.stdin.write(next_task + "\n")
+                stdin_line = f"[CONT] {next_task}" if is_cont else next_task
+                self._proc.stdin.write(stdin_line + "\n")
                 self._proc.stdin.flush()
                 self._remote.send_progress(f"📨 收到指令: {next_task}")
             except Exception:
@@ -515,8 +535,7 @@ class ScreenAIAgent(QObject):
             user_id=self._user_id,
         )
         self._refresh_sidebar()
-        self._result_window.show()
-        self._result_window.hide()
+        self._result_window.show()  # 默认显示窗口
         self._stream_worker: Optional[StreamWorker] = None
         self._capture_win: Optional[CaptureWindow] = None
         self._browser_warmup_thread: Optional[DesktopAgentProcessThread] = None
@@ -760,10 +779,9 @@ class ScreenAIAgent(QObject):
     def _toggle_window(self):
         """切换常驻窗口的显示/隐藏（主线程）。"""
         if self._result_window.isVisible():
-            self._result_window.hide()
+            self._result_window.hide_normal()
         else:
-            self._result_window.show()
-            self._result_window.raise_()
+            self._result_window.show_normal()
 
     def _cursor_move(self, dx: int, dy: int):
         """Ctrl+方向键 — 移动悬浮窗（切回主线程操作 Qt 窗口）。"""
@@ -1150,11 +1168,12 @@ class ScreenAIAgent(QObject):
         self._agent_log_lines.append(msg)
         if self._result_window:
             self._result_window.append_text(f"- {msg}\n")
-        # 转发到手机远程
         if self._remote_server:
             self._remote_server.send_progress(msg)
-            self._result_window.show()
-            self._result_window.raise_()
+            # 远程执行中不弹窗，本地模式才弹
+            if not getattr(self, "_remote_session", False):
+                self._result_window.show()
+                self._result_window.raise_()
 
     def _on_desktop_agent_done(self, success: bool, msg: str):
         # 清理
@@ -1164,6 +1183,9 @@ class ScreenAIAgent(QObject):
             self._result_window.stop_loading()
             status = "完成" if success else "失败"
             self._result_window.append_text(f"\n**{status}：** {msg}\n")
+            # 远程模式：每轮任务完成后恢复本地窗口
+            if getattr(self, "_remote_session", False):
+                self._result_window.show()
 
         # 向远程手机发送结果
         if self._remote_server and getattr(self, "_remote_session", False) and not self._remote_result_sent:
@@ -1398,7 +1420,7 @@ class ScreenAIAgent(QObject):
         ]
         return any(k in text for k in stop_keys)
 
-    def _start_remote_agent(self, task: str):
+    def _start_remote_agent(self, task: str, is_continuation: bool = False):
         self._remote_session = True
         self._remote_current_task = task
         self._remote_task_running = True
@@ -1411,10 +1433,14 @@ class ScreenAIAgent(QObject):
             use_mcp=True,
             user_id=self._user_id,
             memory_key=self._active_conv_id or "remote_desktop",
+            is_continuation=is_continuation,
         )
         self._agent_thread.progress.connect(self._on_desktop_agent_progress)
         self._agent_thread.done.connect(self._on_desktop_agent_done)
         self._agent_thread.start()
+        # 本地窗口：执行期间隐藏，截图干净 + 不挡鼠标
+        if self._result_window:
+            self._result_window.hide()
 
     def _stop_remote_agent(self):
         thread = getattr(self, "_agent_thread", None)

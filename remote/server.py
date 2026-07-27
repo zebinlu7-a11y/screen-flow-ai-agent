@@ -16,11 +16,16 @@ from typing import Optional, Callable
 import aiohttp
 from aiohttp import web
 
+# 安全 harness
+from utils.risk_engine import assess_risk, RiskLevel
+from utils.audit_store import AuditStore, AuditRecord, sanitize_command
+from utils.rollback import get_alternatives, build_alternative_command
+
 
 class RemoteServer:
     """HTTP API 服务器，运行在独立守护线程中。手机通过轮询获取更新。"""
 
-    def __init__(self, port: int = 8765):
+    def __init__(self, port: int = 8765, audit_store: Optional[AuditStore] = None):
         self._port = port
         self._app = web.Application()
         self._runner = None
@@ -30,6 +35,9 @@ class RemoteServer:
         # 回调
         self.on_command: Optional[Callable[[str], None]] = None
         self.on_cancel: Optional[Callable[[], None]] = None
+        self.on_hint: Optional[Callable[[str], None]] = None
+        self.on_direct_command: Optional[Callable[[str], None]] = None
+        self.on_confirmation_needed: Optional[Callable[[dict], None]] = None
 
         # 截图缓存
         self._screenshot_lock = threading.Lock()
@@ -48,6 +56,18 @@ class RemoteServer:
         self._last_command = ""
         self._last_command_time = 0.0
 
+        # ── 安全 harness: 确认状态 ──
+        self._pending_confirmation: Optional[dict] = None
+        self._confirmation_time: float = 0.0
+        self._confirmation_timeout: float = 120.0  # 2分钟超时
+
+        # ── 审计日志 ──
+        self._audit_store = audit_store
+        self._audit_session_id: str = ""
+
+        # ── 任务路由标签 ──
+        self._task_type: str = ""
+
         # PyInstaller 打包后 __file__ 指向临时目录，用 sys._MEIPASS 获取真实路径
         import sys as _sys
         if getattr(_sys, 'frozen', False):
@@ -63,6 +83,9 @@ class RemoteServer:
         self._app.router.add_get("/api/updates", self._handle_updates)
         self._app.router.add_post("/api/command", self._handle_command)
         self._app.router.add_post("/api/cancel", self._handle_cancel)
+        self._app.router.add_post("/api/hint", self._handle_hint)
+        self._app.router.add_post("/api/confirm", self._handle_confirm)
+        self._app.router.add_post("/api/reject", self._handle_reject)
 
     async def _handle_index(self, request):
         try:
@@ -70,7 +93,7 @@ class RemoteServer:
                 html = f.read()
         except FileNotFoundError:
             html = "<h1>phone.html not found</h1>"
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
 
     async def _handle_status(self, request):
         return web.json_response({"status": "ok"})
@@ -85,13 +108,40 @@ class RemoteServer:
             img_time = self._latest_screenshot_time
         result = self._final_result
         self._final_result = None
+
+        # ── 确认超时检查 ──
+        if self._pending_confirmation and time.time() - self._confirmation_time > self._confirmation_timeout:
+            expired_task = self._pending_confirmation.get("task", "")
+            self._add_log(f"⏰ 确认超时，指令已自动取消: {expired_task}")
+            self._pending_confirmation = None
+            # 审计日志: 超时
+            if self._audit_store:
+                self._audit_store.record(AuditRecord(
+                    command_text=sanitize_command(expired_task),
+                    risk_level="high",
+                    confirmation_requested=True,
+                    confirmation_response="timed_out",
+                    execution_path="blocked",
+                    session_id=self._audit_session_id,
+                ))
+
+        # ── 确定状态 ──
+        if self._pending_confirmation:
+            state = "confirming"
+        elif self._agent_running:
+            state = "running"
+        else:
+            state = "ready"
+
         return web.json_response({
             "logs": new_logs,
             "last_id": last_id,
             "screenshot": img,
             "img_time": img_time,
             "result": result,
-            "state": "running" if self._agent_running else "ready",
+            "state": state,
+            "pending_confirmation": self._pending_confirmation,
+            "task_type": self._task_type,
         })
 
     async def _handle_command(self, request):
@@ -108,6 +158,98 @@ class RemoteServer:
             self._last_command_time = now
             print(f"[Remote] HTTP收到指令: {text}")
             self._add_log(f"📨 收到指令: {text}")
+
+            if text.lower() in ("取消", "停止", "cancel", "stop"):
+                result = "已取消，可以发送新指令。"
+                self._add_log(result)
+                if self.on_cancel:
+                    self.on_cancel()
+                self._final_result = {"success": True, "message": result, "elapsed": ""}
+                self._agent_running = False
+                self._pending_confirmation = None
+                return web.json_response({"ok": True, "direct": True, "result": result})
+
+            # —— 设备直达命令（不经过 Agent，直接执行）——
+            from utils.direct_commands import try_direct_command
+            handled, result = try_direct_command(text)
+            if handled:
+                self._add_log(result)
+                self._final_result = {"success": True, "message": result, "elapsed": ""}
+                self._agent_running = False
+                if self.on_direct_command:
+                    self.on_direct_command(result)
+                return web.json_response({"ok": True, "direct": True, "result": result})
+
+            # ── 如果当前有待确认指令，拒绝新指令 ──
+            if self._pending_confirmation:
+                self._add_log("⚠️ 有待确认指令，请先处理后再发新指令")
+                return web.json_response({
+                    "ok": False,
+                    "error": "请先处理待确认的指令，或等待超时自动取消",
+                    "confirming": True,
+                })
+
+            # ── ★ 安全 harness: 风险评估 ──
+            assessment = assess_risk(text)
+            if assessment.needs_confirmation:
+                # 支付/转账直接阻止
+                if assessment.is_blocked:
+                    self._add_log(f"🚫 指令已被安全策略阻止: {assessment.reason}")
+                    if self._audit_store:
+                        self._audit_store.record(AuditRecord(
+                            command_text=sanitize_command(text),
+                            risk_level="critical",
+                            risk_reason=assessment.reason,
+                            risk_category=assessment.category,
+                            confirmation_requested=True,
+                            confirmation_response="blocked",
+                            execution_path="blocked",
+                            rollback_hint=assessment.rollback_hint,
+                            session_id=self._audit_session_id,
+                        ))
+                    return web.json_response({
+                        "ok": False,
+                        "blocked": True,
+                        "reason": assessment.reason,
+                        "alternative": assessment.alternative,
+                    })
+
+                # 高风险 / 严重风险：等待用户确认
+                self._confirmation_time = time.time()
+                self._pending_confirmation = {
+                    "task": text,
+                    "risk_level": assessment.level.value,
+                    "risk_reason": assessment.reason,
+                    "rollback_hint": assessment.rollback_hint,
+                    "alternative": assessment.alternative,
+                    "alternatives": get_alternatives(assessment.category),
+                    "category": assessment.category,
+                    "requested_at": time.strftime("%H:%M:%S"),
+                }
+                self._add_log(f"⚠️ 需要确认: {assessment.reason}")
+                print(f"[Remote] 高风险指令需确认: {text} → {assessment.level.value} ({assessment.category})")
+
+                # 审计日志
+                if self._audit_store:
+                    self._audit_store.record(AuditRecord(
+                        command_text=sanitize_command(text),
+                        risk_level=assessment.level.value,
+                        risk_reason=assessment.reason,
+                        risk_category=assessment.category,
+                        confirmation_requested=True,
+                        confirmation_response="",  # 待用户响应
+                        execution_path="",
+                        rollback_hint=assessment.rollback_hint,
+                        session_id=self._audit_session_id,
+                    ))
+
+                # 通知回调（可选，用于桌面端通知）
+                if self.on_confirmation_needed:
+                    self.on_confirmation_needed(self._pending_confirmation)
+
+                return web.json_response({"ok": True, "confirming": True})
+
+            # SAFE: 直接进入 Agent 执行链
             if self.on_command:
                 self.on_command(text)
             self._agent_running = True
@@ -121,7 +263,133 @@ class RemoteServer:
         if self.on_cancel:
             self.on_cancel()
         self._agent_running = False
+        self._pending_confirmation = None  # 清除待确认状态
         return web.json_response({"ok": True})
+
+    async def _handle_hint(self, request):
+        try:
+            data = await request.json()
+            text = data.get("text", "").strip()
+            if not text:
+                return web.json_response({"ok": True})
+            self._add_log(f"💡 用户提示: {text}")
+            if self.on_hint:
+                self.on_hint(text)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_confirm(self, request):
+        """用户确认执行高风险指令"""
+        try:
+            data = await request.json()
+            confirmed = data.get("confirm", False)
+            pending = self._pending_confirmation
+
+            if not pending:
+                return web.json_response({"ok": False, "error": "没有待确认的指令"}, status=400)
+
+            # 先清除 pending（防重入）
+            task_text = pending["task"]
+            risk_level = pending["risk_level"]
+            risk_category = pending.get("category", "unknown")
+            confirmation_time = self._confirmation_time
+            self._pending_confirmation = None
+
+            if confirmed:
+                self._add_log(f"✅ 用户确认执行: {task_text}")
+                # 审计日志: 确认
+                if self._audit_store:
+                    self._audit_store.record(AuditRecord(
+                        command_text=sanitize_command(task_text),
+                        risk_level=risk_level,
+                        risk_category=risk_category,
+                        confirmation_requested=True,
+                        confirmation_response="confirmed",
+                        confirmation_latency_ms=(time.time() - confirmation_time) * 1000,
+                        execution_path="agent",
+                        rollback_hint=pending.get("rollback_hint", ""),
+                        session_id=self._audit_session_id,
+                    ))
+                # 进入正常执行链
+                if self.on_command:
+                    self.on_command(task_text)
+                self._agent_running = True
+                self._final_result = None
+                return web.json_response({"ok": True, "executing": True})
+            else:
+                self._add_log(f"❌ 用户拒绝执行: {task_text}")
+                return web.json_response({"ok": True, "rejected": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_reject(self, request):
+        """用户拒绝高风险指令，可选替代方案"""
+        try:
+            data = await request.json()
+            alternative_id = data.get("alternative", "")
+            pending = self._pending_confirmation
+
+            if not pending:
+                return web.json_response({"ok": False, "error": "没有待确认的指令"}, status=400)
+
+            task_text = pending["task"]
+            risk_level = pending["risk_level"]
+            risk_category = pending.get("category", "unknown")
+            confirmation_time = self._confirmation_time
+            self._pending_confirmation = None
+
+            self._add_log(f"❌ 用户拒绝: {task_text}"
+                          + (f"，选择替代方案: {alternative_id}" if alternative_id else ""))
+
+            # 审计日志: 拒绝
+            if self._audit_store:
+                self._audit_store.record(AuditRecord(
+                    command_text=sanitize_command(task_text),
+                    risk_level=risk_level,
+                    risk_category=risk_category,
+                    confirmation_requested=True,
+                    confirmation_response="rejected",
+                    confirmation_latency_ms=(time.time() - confirmation_time) * 1000,
+                    alternative_accepted=str(alternative_id) if alternative_id else "",
+                    execution_path="blocked",
+                    rollback_hint=pending.get("rollback_hint", ""),
+                    session_id=self._audit_session_id,
+                ))
+
+            # 如果用户选择了替代方案，构建替代命令并重新提交
+            if alternative_id:
+                new_command = build_alternative_command(task_text, risk_category, alternative_id)
+                if new_command:
+                    self._add_log(f"💡替代方案: {new_command}")
+                    # 替代命令走正常安全检查流程（通常会被判为 SAFE）
+                    alt_assessment = assess_risk(new_command)
+                    if alt_assessment.needs_confirmation:
+                        self._add_log("⚠️替代指令仍为高风险，再次请求确认")
+                        self._confirmation_time = time.time()
+                        self._pending_confirmation = {
+                            "task": new_command,
+                            "risk_level": alt_assessment.level.value,
+                            "risk_reason": alt_assessment.reason,
+                            "rollback_hint": alt_assessment.rollback_hint,
+                            "alternative": alt_assessment.alternative,
+                            "alternatives": get_alternatives(alt_assessment.category),
+                            "category": alt_assessment.category,
+                            "requested_at": time.strftime("%H:%M:%S"),
+                        }
+                        return web.json_response({"ok": True, "confirming": True, "alternative_command": new_command})
+                    else:
+                        # 替代命令安全，直接执行
+                        if self.on_command:
+                            self.on_command(new_command)
+                        self._agent_running = True
+                        self._final_result = None
+                        return web.json_response({"ok": True, "executing": True,
+                                                   "alternative_command": new_command})
+
+            return web.json_response({"ok": True, "rejected": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
 
     def _add_log(self, text: str, ok: Optional[bool] = None):
         with self._log_lock:
@@ -147,9 +415,14 @@ class RemoteServer:
     def send_progress(self, text: str):
         self._add_log(text)
 
-    def send_result(self, success: bool, message: str, elapsed: str = ""):
+    def set_task_type(self, task_type: str):
+        """设置当前任务类型标签（🆕新任务 / 🔄延续任务）"""
+        self._task_type = task_type
+
+    def send_result(self, success: bool, message: str, elapsed: str = "", keep_running: bool = False):
         self._final_result = {"success": success, "message": message, "elapsed": elapsed}
-        self._agent_running = False
+        if not keep_running:
+            self._agent_running = False
         self._add_log(message, ok=success)
 
     def start(self):
@@ -228,6 +501,18 @@ def start_cloudflare_tunnel(port: int) -> Optional[str]:
     try:
         # Find cloudflared binary
         cf = shutil.which("cloudflared")
+        if not cf:
+            import sys as _sys
+
+            if getattr(_sys, "frozen", False):
+                app_dir = os.path.dirname(_sys.executable)
+            else:
+                app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for rel in ("cloudflared.exe", os.path.join("bin", "cloudflared.exe"), os.path.join("tools", "cloudflared.exe")):
+                candidate = os.path.join(app_dir, rel)
+                if os.path.exists(candidate):
+                    cf = candidate
+                    break
         if not cf:
             # Try winget install path
             import glob as _glob
@@ -330,10 +615,18 @@ def get_connection_urls(port: int, ngrok_token: str = "") -> list[dict]:
     if ts_ip:
         url = f"http://{ts_ip}:{port}"
         urls.append({"label": f"Tailscale ({ts_ip})", "url": url, "qr_base64": generate_qr_base64(url)})
-    # 默认不启动 ngrok，避免弹出 ngrok.exe 窗口；需要时手动设置 AIRAG_ENABLE_NGROK=1
-    tunnel_url = start_cloudflare_tunnel(port)
-    if not tunnel_url:
-        tunnel_url = start_ngrok_tunnel(port, ngrok_token)
-    if tunnel_url:
-        urls.append({"label": "公网 (任何网络)", "url": tunnel_url, "qr_base64": generate_qr_base64(tunnel_url)})
+
+    # 公网: 优先用配置的固定地址，否则自动 tunnel
+    try:
+        from config import REMOTE_PUBLIC_URL
+    except ImportError:
+        REMOTE_PUBLIC_URL = ""
+    if REMOTE_PUBLIC_URL:
+        urls.append({"label": "公网 (固定)", "url": REMOTE_PUBLIC_URL, "qr_base64": generate_qr_base64(REMOTE_PUBLIC_URL)})
+    else:
+        tunnel_url = start_cloudflare_tunnel(port)
+        if not tunnel_url:
+            tunnel_url = start_ngrok_tunnel(port, ngrok_token)
+        if tunnel_url:
+            urls.append({"label": "公网 (任何网络)", "url": tunnel_url, "qr_base64": generate_qr_base64(tunnel_url)})
     return urls

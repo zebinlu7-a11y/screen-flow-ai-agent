@@ -688,7 +688,13 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - 看到桌面想搜索: 用 click 点浏览器图标或 press text="win+r" 输入网址
 - 看到浏览器页面: 用 click 点搜索框, 用 type 输入关键词, 用 press text="enter" 搜索
 - 看到目标页面: 任务可能已完成, 返回 done=true
-- 需要用特定软件: 用 press text="win" 打开开始菜单, 然后 type 输入软件名
+- ★ 需要打开/切换到某个软件(QQ/微信/浏览器等)，严格按以下顺序：
+    1) 先看截图底部任务栏，有没有该软件的图标（说明已在后台运行）
+       → 有就直接 click 任务栏图标激活它
+    2) 任务栏没有，再看桌面有没有快捷方式图标
+       → 有就 double 双击打开
+    3) 桌面也没有，用 press text="win" 打开开始菜单，type 输入软件名搜索
+    4) 打开后等 3-5 秒让软件加载，然后再截图观察。如果还是白屏，用 alt_tab 切换窗口
 - 不确定下一步时: 用 wait 等待页面加载
 
 坐标规则:
@@ -722,7 +728,7 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - page_up: 向上翻页，不需要 text
 - wait: 等待，text 为秒数
 - screenshot: 重新截图观察，不需要 text
-- alt_tab: 切换到上一个窗口，不需要 text
+- alt_tab: 切换到上一个窗口，不需要 text。软件打开后白屏或用这个切换
 - focus_window: 点击/激活当前目标窗口，必须给 x,y
 - open_url: 浏览器打开 URL，text 为 URL
 - observe_browser: 检测/连接已有 MCP 或 browser page，并截图观察，不需要 text
@@ -737,13 +743,46 @@ REACT_PROMPT = """你是桌面自动化专家。看截图 → 理解用户意图
 - ask_user 格式: {{"done": false, "action": "ask_user", "text": "你希望我点击的xxx具体在哪？能描述一下位置或形状吗？"}}"""
 
 
+# ── Pydantic 校验模型 ──
+_VALID_ACTIONS = {
+    "click", "double", "double_click", "right", "right_click", "move",
+    "drag", "fill", "copy", "paste", "hotkey", "type", "press",
+    "scroll", "multi_scroll", "page_jump", "page_down", "page_up",
+    "wait", "screenshot", "alt_tab", "focus_window", "focus_app",
+    "open_url", "observe_browser", "activate_browser",
+    "zoom_out", "zoom_in", "maximize", "read_page", "ask_user",
+}
+_COORD_ACTIONS = {
+    "click", "double", "double_click", "right", "right_click",
+    "move", "drag", "fill", "focus_window", "scroll",
+}
+
+
+def _validate_decision(result: dict) -> dict:
+    """校验 LLM 输出的 JSON，不合法则抛 ValueError 触发重试。"""
+    if result.get("done"):
+        reason = result.get("reason", "")
+        if not reason or not reason.strip():
+            raise ValueError("done=True 时 reason 不能为空")
+        return result
+
+    action = result.get("action", "")
+    if action != "ask_user" and action not in _VALID_ACTIONS:
+        raise ValueError(f"无效动作 '{action}'，必须在: {sorted(_VALID_ACTIONS)}")
+    if action in _COORD_ACTIONS:
+        x_val = result.get("x")
+        y_val = result.get("y")
+        if x_val is None or y_val is None:
+            raise ValueError(f"动作 '{action}' 需要 x,y 坐标")
+        if not (0 <= x_val <= 1000 and 0 <= y_val <= 1000):
+            raise ValueError(f"坐标 ({x_val},{y_val}) 超出 0-1000 范围")
+    return result
+
+
 def react_decide(task: str, image: Image.Image, history: List[str],
                  operation_context: str = "",
                  model: str = "doubao-seed-2-0-lite-260428") -> dict:
-    """ReAct 决策：截图 + 任务 + 历史 → {done, thought, action, x, y, text}。
-
-    纯视觉方法 — 模型观察截图，自己思考下一步该做什么、点哪里。
-    """
+    """ReAct 决策：截图 + 任务 + 历史 → {done, thought, action, x, y, text}。"""
     from agent.llm_client import ChatDoubaoVL
     from langchain_core.messages import HumanMessage
 
@@ -792,7 +831,7 @@ Additional execution rules:
         response = llm.invoke([HumanMessage(content=content)])
         text = response.content if hasattr(response, 'content') else ""
 
-        # Parse JSON
+        # Parse JSON (fix: don't blindly replace ' with ", it corrupts strings)
         m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
         if m:
             text = m.group(1)
@@ -800,7 +839,14 @@ Additional execution rules:
             s, e = text.find("{"), text.rfind("}") + 1
             if s >= 0 and e > s:
                 text = text[s:e]
-        result = json.loads(text.replace("'", '"'))
+        # 只修复常见 LLM 输出错误，不做全局替换
+        text = text.strip()
+        text = re.sub(r',\s*}', '}', text)
+        text = re.sub(r',\s*]', ']', text)
+        result = json.loads(text)
+
+        # ★ Pydantic-level validation
+        result = _validate_decision(result)
 
         # Normalize coordinates: 0-1000 → pixel
         if not result.get("done") and "x" in result and "y" in result:
@@ -837,11 +883,63 @@ def _fingerprint_distance(a: tuple, b: tuple) -> int:
     return sum(abs(x - y) for x, y in zip(a, b))
 
 
+def _ensure_mouse_moved(x: int, y: int):
+    """Move mouse to (x,y) with multiple fallback strategies.
+
+    1. pyautogui.moveTo
+    2. ctypes SetCursorPos
+    3. ctypes SendInput (lowest level)
+    """
+    import pyautogui
+    pyautogui.moveTo(x, y, duration=0.15)
+    time.sleep(0.05)
+    actual = pyautogui.position()
+    if abs(actual.x - x) <= 2 and abs(actual.y - y) <= 2:
+        return
+
+    # Fallback 1: SetCursorPos
+    print(f"[Mouse] moveTo failed: target=({x},{y}) actual=({actual.x},{actual.y})")
+    try:
+        import ctypes
+        ctypes.windll.user32.SetCursorPos(x, y)
+        time.sleep(0.05)
+        actual = pyautogui.position()
+        if abs(actual.x - x) <= 2 and abs(actual.y - y) <= 2:
+            print(f"[Mouse] SetCursorPos OK: ({actual.x},{actual.y})")
+            return
+    except Exception as e:
+        print(f"[Mouse] SetCursorPos error: {e}")
+
+    # Fallback 2: SendInput
+    print(f"[Mouse] SetCursorPos also failed, trying SendInput")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # MOUSEINPUT + INPUT_MOUSE + MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        abs_x = int(x * 65536 / screen_w)
+        abs_y = int(y * 65536 / screen_h)
+        inp = INPUT(0, MOUSEINPUT(abs_x, abs_y, 0, 0x0001 | 0x8000, 0, None))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        time.sleep(0.05)
+        actual = pyautogui.position()
+        print(f"[Mouse] SendInput result: ({actual.x},{actual.y})")
+    except Exception as e:
+        print(f"[Mouse] SendInput error: {e}")
+
+
 def _pyautogui_click(x: int, y: int):
     import pyautogui
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.2
-    pyautogui.moveTo(x, y, duration=0.15)
+    _ensure_mouse_moved(x, y)
     pyautogui.click()
 
 
@@ -849,7 +947,7 @@ def _pyautogui_double_click(x: int, y: int):
     import pyautogui
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.2
-    pyautogui.moveTo(x, y, duration=0.15)
+    _ensure_mouse_moved(x, y)
     pyautogui.doubleClick()
 
 
@@ -857,7 +955,7 @@ def _pyautogui_right_click(x: int, y: int):
     import pyautogui
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.2
-    pyautogui.moveTo(x, y, duration=0.15)
+    _ensure_mouse_moved(x, y)
     pyautogui.rightClick()
 
 
@@ -865,15 +963,17 @@ def _pyautogui_move(x: int, y: int):
     import pyautogui
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.2
-    pyautogui.moveTo(x, y, duration=0.15)
+    _ensure_mouse_moved(x, y)
 
 
 def _pyautogui_drag(x: int, y: int, x2: int, y2: int):
     import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.2
-    pyautogui.moveTo(x, y, duration=0.15)
-    pyautogui.dragTo(x2, y2, duration=0.35, button="left")
+    pyautogui.FAILSAFE = False  # 拖拽从桌面到应用跨度大，容易触发 FAILSAFE，ReAct 有取消机制兜底
+    pyautogui.PAUSE = 0.15
+    _ensure_mouse_moved(x, y)
+    time.sleep(0.2)
+    pyautogui.dragTo(x2, y2, duration=0.8, button="left")
+    time.sleep(0.25)
 
 
 def _pyautogui_type(text: str):
@@ -907,48 +1007,68 @@ def _pyautogui_hotkey(key: str):
 
 
 def _pyautogui_scroll(direction: str, x: int = 0, y: int = 0):
+    """Scroll with model-controlled amount.
+
+    direction can be:
+      - Numeric: "-3" / "8" / "-15" → scroll lines directly
+      - dir:amount: "down:12" / "up:8"
+      - Direction name: "down" / "up" → +/-6 (fine-tune default)
+    Keyboard PageDown fallback only triggers when |amount| >= 10.
+    """
     import pyautogui
     direction = (direction or "down").strip().lower()
+    amount = 0
+    # 1. Numeric first: "-8" → -8, "15" → 15
     if direction.lstrip("-").isdigit():
         amount = int(direction)
-    elif direction in ("down", "roll_down"):
-        amount = -12
-    elif direction in ("long_down", "pagedown", "page_down"):
-        amount = -20
-    elif direction in ("long_up", "pageup", "page_up"):
-        amount = 20
+    # 2. dir:amount: "down:12" → -12, "up:5" → 5
+    elif ":" in direction:
+        parts = direction.split(":", 1)
+        dir_part = parts[0].strip()
+        try:
+            amt_val = int(parts[1].strip())
+        except ValueError:
+            amt_val = 6
+        if "up" in dir_part:
+            amount = abs(amt_val)
+        elif "down" in dir_part:
+            amount = -abs(amt_val)
+        else:
+            amount = amt_val
+    # 3. Direction fallback: "down"/"up" → +/-6
+    elif "up" in direction:
+        amount = 6
     else:
-        amount = 12
+        amount = -6
+
     try:
         if x > 0 and y > 0:
-            pyautogui.moveTo(x, y, duration=0.1)
+            _ensure_mouse_moved(x, y)
         else:
             w, h = pyautogui.size()
-            pyautogui.moveTo(w // 2, h // 2, duration=0.1)
+            _ensure_mouse_moved(w // 2, h // 2)
     except Exception:
         pass
     print(f"[PyAutoGUI] scroll amount={amount} at=({x},{y})", flush=True)
     pyautogui.scroll(amount)
     _native_mouse_wheel(amount)
-    # 键盘兜底：文件夹等不响应模拟滚轮，用 PageDown/PageUp 翻页
-    time.sleep(0.15)
-    if amount < 0:
+    # Keyboard fallback only for large scrolls
+    if abs(amount) >= 10:
+        time.sleep(0.15)
+        key = "pagedown" if amount < 0 else "pageup"
         count = max(1, abs(amount) // 10)
         for _ in range(count):
-            pyautogui.press("pagedown")
+            pyautogui.press(key)
             time.sleep(0.05)
-    elif amount > 0:
-        count = max(1, amount // 10)
-        for _ in range(count):
-            pyautogui.press("pageup")
-            time.sleep(0.05)
+    else:
+        time.sleep(0.2)
 
 
 def _pyautogui_page(direction: str, x: int = 0, y: int = 0):
     import pyautogui
     if x > 0 and y > 0:
         try:
-            pyautogui.moveTo(x, y, duration=0.1)
+            _ensure_mouse_moved(x, y)
             time.sleep(0.05)
         except Exception:
             pass
@@ -984,9 +1104,11 @@ def _parse_count_text(text: str, default: int = 3, limit: int = 20) -> tuple:
 
 def _pyautogui_multi_scroll(text: str, x: int = 0, y: int = 0):
     direction, count = _parse_count_text(text, default=5, limit=15)
-    for _ in range(count):
+    for i in range(count):
         _pyautogui_scroll("long_up" if direction == "up" else "long_down", x, y)
-        time.sleep(0.08)
+        time.sleep(0.15)
+        if (i + 1) % 3 == 0 and i + 1 < count:
+            time.sleep(0.3)
 
 
 def _pyautogui_page_jump(text: str):
@@ -1209,6 +1331,8 @@ class LoopController:
         self.last_image_fp = None
         self.unchanged_screen_count = 0
         self.strategy_attempts = []
+        self.last_strategy = ""
+        self.same_strategy_count = 0
 
     def observe_image(self, image: Image.Image):
         current_fp = _image_fingerprint(image)
@@ -1216,6 +1340,9 @@ class LoopController:
             self.unchanged_screen_count += 1
         else:
             self.unchanged_screen_count = 0
+            # ★ 画面变了 → 上一步成功了 → 重置恢复计数
+            self.recovery_attempts = 0
+            self.same_strategy_count = 0
         self.last_image_fp = current_fp
 
     def maybe_recover(self, action: str, text: str, x: int, y: int,
@@ -1228,8 +1355,17 @@ class LoopController:
             self.same_action_count += 1
         else:
             self.same_action_count = 0
+        if strategy == self.last_strategy:
+            self.same_strategy_count += 1
+        else:
+            self.same_strategy_count = 0
+        self.last_strategy = strategy
 
-        if self.same_action_count < 1 and self.unchanged_screen_count < 2:
+        stuck_exact = self.same_action_count >= 1
+        stuck_strategy = self.same_strategy_count >= 2 and self.unchanged_screen_count >= 1
+        stuck_screen = self.unchanged_screen_count >= 2
+
+        if not (stuck_exact or stuck_strategy or stuck_screen):
             return action, text, x, y, x2, y2, strategy, len(self.strategy_attempts), ""
 
         self.recovery_attempts += 1
@@ -1253,6 +1389,7 @@ class LoopController:
         x2 = recovery.get("x2_pixel", x2)
         y2 = recovery.get("y2_pixel", y2)
         self.unchanged_screen_count = 0
+        self.same_strategy_count = 0
         note = f"检测到连续重复或画面未变化，自动从 {old_strategy}/{old_action} 切换为 {strategy}/{action}（第 {self.recovery_attempts}/{self.max_recoveries} 种方法）"
         return action, text, x, y, x2, y2, strategy, len(self.strategy_attempts), note
 
@@ -1325,27 +1462,30 @@ def run_gui_task(task: str,
                  use_browser: bool = True,
                  keep_browser_open: bool = False,
                  cancel_file: str = "",
+                 hint_file: str = "",
                  progress_callback: Callable = None,
                  hide_window: Callable = None,
                  show_window: Callable = None,
                  shared_mcp: Optional[BrowserMCP] = None,
                  user_id: str = "default",
-                 memory_key: str = "desktop") -> dict:
+                 memory_key: str = "desktop",
+                 is_continuation: bool = False) -> dict:
     """Run GUI automation as ReAct core decision + Loop Engineer control."""
     import pyautogui
 
     mcp = shared_mcp or BrowserMCP(keep_browser_open=keep_browser_open)  # 延迟连接: AI 调用 open_url 时才 connect()
 
     browser_mode = bool(use_browser and is_browser_task(task))
+    # ── 记忆门控: 延续任务才加载上轮上下文 ──
     operation_context = ""
-    try:
-        from utils.gui_operation_memory import build_operation_context
-
-        operation_context = build_operation_context(user_id, memory_key, task)
-        if operation_context and progress_callback:
-            progress_callback("已加载当前操作窗口历史流程")
-    except Exception as exc:
-        print(f"[GuiOpMemory] load skipped: {exc}")
+    if is_continuation:
+        try:
+            from utils.gui_operation_memory import build_operation_context
+            operation_context = build_operation_context(user_id, memory_key)
+            if operation_context:
+                print(f"[Memory] 延续任务，已加载操作记忆 (key={memory_key})")
+        except Exception as exc:
+            print(f"[Memory] 加载操作记忆失败: {exc}")
 
     # --- Loop Engineer: observe -> ReAct decide -> execute -> recover ---
     history = []
@@ -1369,10 +1509,10 @@ def run_gui_task(task: str,
         if progress_callback:
             progress_callback(f"🔄 ReAct 第{iteration+1}步: 截图观察...")
 
-        # Hide AIRAG window for clean screenshot
+        # ★ 截图前隐藏 AIRAG 窗口（获取干净截图）
         if hide_window:
             hide_window()
-            time.sleep(0.2)
+            time.sleep(0.25)
 
         img = None
         if browser_mode and mcp.connected:
@@ -1381,10 +1521,7 @@ def run_gui_task(task: str,
             img = _screenshot_desktop()
         loop.observe_image(img)
 
-        if show_window:
-            show_window()
-
-        # ReAct decision
+        # ReAct decision（窗口仍隐藏，LLM 调用期间不遮挡桌面）
         decision = react_decide(task, img, history, operation_context=operation_context)
 
         if decision.get("done"):
@@ -1450,6 +1587,8 @@ def run_gui_task(task: str,
                 progress_callback(f"  🧭 state={state[:40] or '-'} | goal={goal[:40] or '-'} | strategy={strategy} | attempt={attempt}")
             progress_callback(f"  💭 {thought[:100]}")
             if action == "click":
+                progress_callback(f"  🖱️ {action} ({x},{y})")
+            elif action in ("double", "double_click", "right", "right_click"):
                 progress_callback(f"  🖱️ {action} ({x},{y})")
             elif action == "type":
                 progress_callback(f"  ⌨️ {action}: \"{text[:50]}\"")
@@ -1567,26 +1706,84 @@ def run_gui_task(task: str,
                     time.sleep(2)
                 else:
                     _open_url_in_browser(text, mcp)
+            elif action == "focus_app":
+                from utils.app_control import focus_or_launch_app, match_app_key
+                app_key = match_app_key(text or task)
+                if app_key:
+                    ok, msg = focus_or_launch_app(app_key)
+                    print(f"[ReAct] focus_app: {app_key} → {msg}")
+                    if progress_callback:
+                        progress_callback(f"  📱 {msg}")
+                    text = f"focus_app {app_key}: {msg}"
+                else:
+                    print(f"[ReAct] focus_app: 无法识别应用 '{text}'")
+                    text = f"focus_app failed: unknown app '{text}'"
             elif action == "ask_user":
-                # AI 不确定，询问用户 — 直接结束循环返回提示
                 ask_msg = text or "当前截图未找到明确目标，请描述你想点击的位置或下一步操作。"
                 print(f"[ReAct] ask_user: {ask_msg}")
-                history.append(f"[{iteration+1}] {thought} → ask_user: {ask_msg}")
-                return {
-                    "success": False,
-                    "message": f"AI 不确定下一步：{ask_msg}",
-                    "steps_done": f"{len(history)}/{iteration+1}",
-                    "need_human": True,
-                    "elapsed": f"{time.time() - start_time:.1f}s",
-                }
+                if progress_callback:
+                    progress_callback(f"  ❓ {ask_msg}")
+                    progress_callback("  ⏳ 等待用户回复（手机端输入提示后发送）...")
+
+                user_reply = ""
+                if hint_file:
+                    try:
+                        with open(hint_file, "w", encoding="utf-8") as _hf:
+                            _hf.write("")
+                    except Exception:
+                        pass
+                    waited = 0
+                    while waited < 120:
+                        time.sleep(2)
+                        waited += 2
+                        if cancel_file and os.path.exists(cancel_file):
+                            return {
+                                "success": False, "canceled": True,
+                                "message": "操作已被用户取消",
+                                "steps_done": f"{len(history)}/{iteration+1}",
+                                "need_human": False,
+                            }
+                        try:
+                            if os.path.exists(hint_file):
+                                with open(hint_file, "r", encoding="utf-8") as _hf:
+                                    content = _hf.read().strip()
+                                if content:
+                                    user_reply = content
+                                    with open(hint_file, "w", encoding="utf-8") as _hf:
+                                        _hf.write("")
+                                    break
+                        except Exception:
+                            pass
+
+                if user_reply:
+                    print(f"[ReAct] 用户回复: {user_reply}")
+                    if progress_callback:
+                        progress_callback(f"  💡 用户回复: {user_reply}")
+                    history.append(f"[{iteration+1}] ask_user: {ask_msg}")
+                    history.append(f"[用户回复] {user_reply}")
+                    task = f"{task}\n\n【用户刚才的指引】: {user_reply}"
+                    continue
+                else:
+                    history.append(f"[{iteration+1}] {thought} → ask_user (超时无回复): {ask_msg}")
+                    return {
+                        "success": False,
+                        "message": f"AI 不确定下一步（用户未回复）：{ask_msg}",
+                        "steps_done": f"{len(history)}/{iteration+1}",
+                        "need_human": True,
+                        "elapsed": f"{time.time() - start_time:.1f}s",
+                    }
             else:
                 print(f"[ReAct] 未知动作: {action}")
         except Exception as e:
             print(f"[ReAct] 执行失败: {e}")
 
+        # ★ 动作执行完毕，恢复 AIRAG 窗口
+        if show_window:
+            show_window()
+
         # Record history
         action_desc = f"{action}"
-        if action == "click":
+        if action in ("click", "double", "double_click", "right", "right_click"):
             action_desc += f" ({x},{y})"
         elif action in ("type", "press", "scroll", "multi_scroll", "page_jump"):
             action_desc += f" \"{text}\""
@@ -1604,12 +1801,12 @@ def run_gui_task(task: str,
 
     if loop.forced_failure:
         failure_audit = {"success": False, "reason": loop.forced_failure, "need_human": True}
-        try:
-            from utils.gui_operation_memory import update_operation_memory
-
-            update_operation_memory(user_id, memory_key, task, history, failure_audit)
-        except Exception as exc:
-            print(f"[GuiOpMemory] update skipped: {exc}")
+        if is_continuation:
+            try:
+                from utils.gui_operation_memory import update_operation_memory
+                update_operation_memory(user_id, memory_key, task, history, failure_audit)
+            except Exception as exc:
+                print(f"[Memory] 更新操作记忆失败: {exc}")
         return {
             "success": False,
             "message": loop.forced_failure,
@@ -1633,12 +1830,13 @@ def run_gui_task(task: str,
                  "reason": f"已执行 {len(history)} 个动作；审计截图失败: {e}",
                  "need_human": False}
 
-    try:
-        from utils.gui_operation_memory import update_operation_memory
-
-        update_operation_memory(user_id, memory_key, task, history, audit)
-    except Exception as exc:
-        print(f"[GuiOpMemory] update skipped: {exc}")
+    if is_continuation:
+        try:
+            from utils.gui_operation_memory import update_operation_memory
+            update_operation_memory(user_id, memory_key, task, history, audit)
+            print(f"[Memory] 操作记忆已更新 (key={memory_key})")
+        except Exception as exc:
+            print(f"[Memory] 更新操作记忆失败: {exc}")
 
     # 任务完成后不关闭浏览器，保留页面供用户查看
     # ESC 取消时才关闭 (见上方 cancel_file 检查)

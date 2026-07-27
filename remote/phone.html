@@ -26,6 +26,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .btn-send:active{opacity:.7}
 .btn-cancel:active{opacity:.7}
 .btn-send:disabled,.btn-cancel:disabled{opacity:.4}
+/* ── 确认面板 ── */
+.confirm-panel{background:#1e1e3a;border-left:4px solid #ff9800;margin:0;padding:12px 14px;flex-shrink:0;display:none}
+.confirm-panel.critical{border-left-color:#f44336}
+.confirm-panel .confirm-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.confirm-panel .risk-badge{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:700}
+.confirm-panel .risk-badge.high{background:#ff9800;color:#000}
+.confirm-panel .risk-badge.critical{background:#f44336;color:#fff}
+.confirm-panel .confirm-title{font-size:14px;font-weight:600;color:#fff}
+.confirm-panel .confirm-field{margin:6px 0;font-size:13px;line-height:1.5}
+.confirm-panel .confirm-field .label{color:#888;font-size:11px}
+.confirm-panel .confirm-field .value{color:#ddd}
+.confirm-panel .confirm-task{background:#0d0d1a;padding:8px 10px;border-radius:6px;font-size:13px;color:#00d4ff;margin:8px 0;word-break:break-all}
+.confirm-panel .confirm-rollback{color:#ff9800;font-size:12px;margin:8px 0;padding:6px 8px;background:rgba(255,152,0,.1);border-radius:4px}
+.confirm-panel.critical .confirm-rollback{color:#f44336;background:rgba(244,67,54,.1)}
+.confirm-panel .confirm-alternatives{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.confirm-panel .alt-chip{padding:6px 12px;border-radius:14px;font-size:12px;background:#0f3460;color:#aaa;cursor:pointer;border:1px solid transparent;transition:all .15s}
+.confirm-panel .alt-chip:active,.confirm-panel .alt-chip.selected{background:#1a4a80;color:#00d4ff;border-color:#00d4ff}
+.confirm-panel .confirm-actions{display:flex;gap:10px;margin-top:12px}
+.confirm-panel .confirm-actions button{flex:1;padding:10px;border-radius:20px;border:none;font-size:14px;font-weight:700;cursor:pointer}
+.confirm-panel .btn-confirm{background:#4caf50;color:#fff}
+.confirm-panel .btn-reject{background:#f44336;color:#fff}
+.confirm-panel .btn-confirm:active,.confirm-panel .btn-reject:active{opacity:.7}
+/* blocked 横幅 */
+.blocked-banner{background:rgba(244,67,54,.15);border:1px solid #f44336;border-radius:6px;padding:10px 12px;margin:8px 0;font-size:13px;color:#f44336;text-align:center}
 </style>
 </head>
 <body>
@@ -42,10 +66,42 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 
 <div class="log-area" id="logArea"></div>
 
-<div class="input-bar">
+<!-- ★ 安全 harness: 确认面板 -->
+<div class="confirm-panel" id="confirmPanel">
+  <div class="confirm-header">
+    <span class="risk-badge" id="riskBadge">⚠️ 高风险</span>
+    <span class="confirm-title">需要确认</span>
+  </div>
+  <div class="confirm-field">
+    <span class="label">原始指令</span>
+    <div class="confirm-task" id="confirmTask"></div>
+  </div>
+  <div class="confirm-field">
+    <span class="label">风险原因</span>
+    <div class="value" id="confirmReason"></div>
+  </div>
+  <div class="confirm-rollback" id="confirmRollback"></div>
+  <div class="confirm-field" style="margin-top:10px">
+    <span class="label">替代方案（可选）</span>
+  </div>
+  <div class="confirm-alternatives" id="confirmAlternatives"></div>
+  <div class="confirm-actions">
+    <button class="btn-confirm" onclick="confirmAction()">✅ 确认执行</button>
+    <button class="btn-reject"  onclick="rejectAction()">❌ 拒绝</button>
+  </div>
+</div>
+
+<!-- blocked 横幅（支付/转账等） -->
+<div class="blocked-banner" id="blockedBanner" style="display:none"></div>
+
+<div class="input-bar" id="inputBar">
   <input type="text" id="cmdInput" placeholder="输入指令, 如: 打开百度搜索python" autocomplete="off">
   <button class="btn-send" id="btnSend" onclick="sendCommand()">发送</button>
   <button class="btn-cancel" id="btnCancel" onclick="cancelTask()">取消</button>
+</div>
+<div class="input-bar" id="hintBar" style="display:none;background:#1a1a2e;">
+  <input type="text" id="hintInput" placeholder="💡 输入提示引导AI，如: 文件在桌面" autocomplete="off" style="background:#1a2744;">
+  <button class="btn-send" onclick="sendHint()" style="background:#e6b800;color:#000;">提示</button>
 </div>
 
 <script>
@@ -55,6 +111,7 @@ let lastImgTime = '';
 let connected = false;
 let pollTimer = null;
 let lastResultKey = '';
+let selectedAlternative = '';
 
 function connect() {
   setStatus('连接中...');
@@ -100,9 +157,30 @@ function poll() {
       }
       setStatus(data.result.success ? '完成' : '失败');
       enableButtons(true);
+      // 结果出来后恢复输入栏
+      document.getElementById('inputBar').style.display = 'flex';
+    }
+    // ── 安全 harness: 确认面板 ──
+    if (data.state === 'confirming' && data.pending_confirmation) {
+      showConfirmPanel(data.pending_confirmation);
+      document.getElementById('inputBar').style.display = 'none';
+      setStatus('等待确认');
+    } else if (data.state !== 'confirming') {
+      hideConfirmPanel();
+      // 只在非运行状态时恢复输入栏
+      if (data.state !== 'running') {
+        document.getElementById('inputBar').style.display = 'flex';
+      }
     }
     // 状态
-    if (data.state) setStatus(data.state);
+    if (data.state) {
+      if (data.state !== 'confirming') {
+        // 显示任务类型标签
+        const typeLabel = data.task_type || '';
+        setStatus((typeLabel ? typeLabel + ' ' : '') + data.state);
+      }
+      showHintBar(data.state === 'running');
+    }
     if (!connected) { connected = true; setStatus('就绪'); }
   }).catch(() => {
     if (connected) { connected = false; setStatus('断开'); log('连接断开，重连中...', false); }
@@ -117,7 +195,30 @@ function sendCommand() {
     .then(r => r.json()).then(d => {
       log('📨 ' + text);
       input.value = '';
-      enableButtons(!!d.skipped);
+
+      // 高风险触发确认
+      if (d.confirming) {
+        enableButtons(true);
+        poll();  // 立即轮询获取确认面板
+        return;
+      }
+      // 已被安全策略阻止
+      if (d.blocked) {
+        showBlockedBanner(d.reason || '此操作已被安全策略阻止');
+        enableButtons(true);
+        log('🚫 ' + (d.reason || '操作已被阻止'));
+        setTimeout(() => hideBlockedBanner(), 5000);
+        return;
+      }
+      // 有待确认指令，拒绝新指令
+      if (d.error) {
+        log('⚠️ ' + d.error, false);
+        enableButtons(true);
+        return;
+      }
+      enableButtons(!!d.skipped || !!d.direct || !!d.result || d.ok === false);
+      // 快速指令结果立即显示
+      if (d.result) log(d.result);
       // 立即轮询一次
       poll();
     }).catch(() => {
@@ -131,7 +232,23 @@ function cancelTask() {
     log('⏹️ 已发送取消信号');
     enableButtons(true);
     setStatus('ready');
+    document.getElementById('hintBar').style.display = 'none';
   }).catch(() => log('⚠️ 取消失败', false));
+}
+
+function sendHint() {
+  const input = document.getElementById('hintInput');
+  const text = input.value.trim();
+  if (!text) return;
+  fetch('/api/hint', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})})
+    .then(r => r.json()).then(() => {
+      log('💡 提示: ' + text);
+      input.value = '';
+    }).catch(() => log('⚠️ 提示发送失败', false));
+}
+
+function showHintBar(show) {
+  document.getElementById('hintBar').style.display = show ? 'flex' : 'none';
 }
 
 function log(text, isOk) {
@@ -147,6 +264,120 @@ function enableButtons(enabled) { document.getElementById('btnSend').disabled = 
 document.getElementById('cmdInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendCommand();
 });
+document.getElementById('hintInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendHint();
+});
+
+// ============================================================
+// 安全 harness: 确认面板函数
+// ============================================================
+
+function showConfirmPanel(info) {
+  const panel = document.getElementById('confirmPanel');
+  document.getElementById('confirmTask').textContent = info.task || '';
+  document.getElementById('confirmReason').textContent = info.risk_reason || '';
+  document.getElementById('confirmRollback').textContent = '⚠ ' + (info.rollback_hint || '');
+
+  // 风险等级样式
+  const badge = document.getElementById('riskBadge');
+  panel.classList.remove('critical');
+  badge.classList.remove('high', 'critical');
+  if (info.risk_level === 'critical') {
+    badge.textContent = '🔴 严重风险';
+    badge.classList.add('critical');
+    panel.classList.add('critical');
+  } else {
+    badge.textContent = '🟡 高风险';
+    badge.classList.add('high');
+  }
+
+  // 替代方案 chips
+  const altDiv = document.getElementById('confirmAlternatives');
+  altDiv.innerHTML = '';
+  selectedAlternative = '';
+  (info.alternatives || []).forEach(alt => {
+    const chip = document.createElement('span');
+    chip.className = 'alt-chip';
+    chip.textContent = alt.text;
+    chip.title = alt.description || '';
+    chip.onclick = () => selectAlternative(alt.id, chip);
+    altDiv.appendChild(chip);
+    // 排除 "取消操作" — 这是默认行为
+  });
+
+  panel.style.display = 'block';
+  hideBlockedBanner();
+}
+
+function hideConfirmPanel() {
+  document.getElementById('confirmPanel').style.display = 'none';
+  selectedAlternative = '';
+}
+
+function selectAlternative(id, chipEl) {
+  // 切换选中状态
+  document.querySelectorAll('#confirmAlternatives .alt-chip').forEach(c => c.classList.remove('selected'));
+  if (selectedAlternative === id) {
+    selectedAlternative = '';
+  } else {
+    chipEl.classList.add('selected');
+    selectedAlternative = id;
+  }
+}
+
+function confirmAction() {
+  fetch('/api/confirm', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({confirm: true})
+  }).then(r => r.json()).then(d => {
+    hideConfirmPanel();
+    document.getElementById('inputBar').style.display = 'flex';
+    enableButtons(false);
+    setStatus('running');
+    poll();
+  }).catch(() => log('⚠️ 确认失败', false));
+}
+
+function rejectAction() {
+  const payload = selectedAlternative ? {alternative: selectedAlternative} : {};
+  fetch('/api/reject', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r => r.json()).then(d => {
+    hideConfirmPanel();
+    // 如果替代方案直接执行了
+    if (d.executing) {
+      document.getElementById('inputBar').style.display = 'flex';
+      enableButtons(false);
+      setStatus('running');
+    } else if (d.confirming) {
+      // 替代方案仍需确认 — 等 poll 展示新面板
+      document.getElementById('inputBar').style.display = 'none';
+    } else {
+      document.getElementById('inputBar').style.display = 'flex';
+      enableButtons(true);
+      setStatus('ready');
+      log('❌ 已拒绝执行');
+    }
+    poll();
+  }).catch(() => {
+    hideConfirmPanel();
+    document.getElementById('inputBar').style.display = 'flex';
+    log('⚠️ 操作失败', false);
+  });
+}
+
+function showBlockedBanner(msg) {
+  const banner = document.getElementById('blockedBanner');
+  banner.textContent = '🚫 ' + (msg || '此操作已被安全策略阻止');
+  banner.style.display = 'block';
+}
+
+function hideBlockedBanner() {
+  document.getElementById('blockedBanner').style.display = 'none';
+}
 
 connect();
 </script>

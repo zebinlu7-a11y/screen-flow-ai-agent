@@ -5,7 +5,7 @@
 <h2 align="center">Ai_Flow — 智能远程桌面AI助手</h2>
 
 <p align="center">
-  <b>远程操控智能体·ReAct 桌面自动化·安全隐私保护</b>
+  <b>远程桌面操控智能体 · ReAct 桌面自动化 · 安全隐私保护</b>
 </p>
 
 ---

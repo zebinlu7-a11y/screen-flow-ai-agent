@@ -14,9 +14,7 @@
 
 Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任意区域，豆包多模态大模型流式解析。也可以直接在输入框打字对话。
 
-内置 **ReAct GUI Agent**——纯视觉决策引擎，AI 看截图自己决定下一步该点哪里、敲什么。输入自然语言即可自动操作桌面和浏览器：打开软件、搜索网页、填写表单、点击按钮，完全模拟人类操作。
-
-支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**RAG 驱动的多层记忆系统**（检索增强生成）让 AI 记住你是谁、你在做什么项目、你的偏好——BM25+语义双路召回 → RRF 融合 → rerank 精排 → 注入 prompt。**MCP 浏览器自动化**让你操控浏览器像操控本地应用一样自然。**安全 Harness** 为远程指令提供风险评估、确认门禁、审计追踪和回滚方案，高危操作需手机端二次确认才执行。
+内置 **ReAct GUI Agent**——纯视觉决策引擎，AI 看截图自己决定下一步该点哪里、敲什么。输入自然语言即可自动操作桌面和浏览器：打开软件、搜索网页、填写表单、点击按钮，完全模拟人类操作。支持**手机远程控制**，手机浏览器扫码即可实时查看 PC 屏幕并发送指令。**RAG 驱动的多层记忆系统**（检索增强生成）让 AI 记住你是谁、你在做什么项目、你的偏好——BM25+语义双路召回 → RRF 融合 → rerank 精排 → 注入 prompt。**安全 Harness** 为远程指令提供风险评估、确认门禁、审计追踪和回滚方案，高危操作需手机端二次确认才执行。
 
 - **纯文本对话** — 悬浮窗底部输入框打字，Enter 发送
 - **截图提问** — `Ctrl+D` 连续截图，缩略图累积，点发送统一提交
@@ -94,10 +92,10 @@ Ai_Flow 是一个 Windows 桌面常驻悬浮窗。按下快捷键截取屏幕任
 | **RAG 记忆系统** | Embedding | `doubao-embedding-text-240715` 文本向量化，FAISS IndexFlatIP 内积索引 |
 | | Retrieval | 三路召回：BM25 关键词 + 语义向量 + jieba 分词关键词 |
 | | Rerank | RRF 双路融合 + lightweight rerank 精排，Top-K 注入 prompt |
-| | Augment | 长期记忆：LLM 后台提取事实 → Jaccard 去重 → FAISS 语义检索 → System Prompt |
+| | Augment | 长期记忆：LLM 后台提取事实 → FAISS 语义检索 → System Prompt |
 | **语音 & OCR** | 语音输入 | PyAudio 实时录音 + 腾讯云 ASR，静默 0.8s 自动断句，滚轮选句子 |
 | | OCR 识别 | 腾讯云 GeneralBasicOCR，1000 次/月免费，批量多区域识别 |
-| **隐私 & 设置** | 隐私保护 | `SetWindowDisplayAffinity(0x11)` 防屏幕捕获，截图/录屏/会议看不到悬浮窗 |
+| **隐私 & 设置** | 隐私保护 | 防屏幕捕获，截图看不到悬浮窗 |
 | | 即时设置 | 悬浮窗底部按钮，随时配置 API Key / 代理 / OCR 凭证 |
 | | 系统托盘 | 最小化到托盘，右键菜单操作，气泡提示 |
 | | 对话管理 | 侧边栏切换/搜索/重命名/删除对话，多用户按 API Key 隔离 |
@@ -289,12 +287,12 @@ pyinstaller打包压缩成ZIP，解压双击 `Ai_Flow.exe` 运行。
 │  remote/             手机远程        │  ├─ user_manager.py     │
 │  ├─ server.py        HTTP API       │  ├─ api_key_manager.py  │
 │  └─ phone.html       手机界面+Harness│  ├─ token_counter.py    │
-│                                      │  ├─ risk_engine.py 🔒   │
-│                                      │  ├─ audit_store.py 📋   │
-│                                      │  ├─ rollback.py    ↩️    │
-│                                      │  ├─ direct_commands.py ⚡│
-│                                      │  ├─ task_router.py  🔀  │
-│                                      │  └─ app_control.py  🪟  │
+│                                      │  ├─ risk_engine.py    │
+│                                      │  ├─ audit_store.py    │
+│                                      │  ├─ rollback.py        │
+│                                      │  ├─ direct_commands.py │
+│                                      │  ├─ task_router.py    │
+│                                      │  └─ app_control.py    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,8 +308,8 @@ AIRAG/
 ├── agent/                      # AI Agent 核心
 │   ├── state.py                # LangGraph AgentState 类型定义
 │   ├── graph.py                # LangGraph 状态机 + 流式对话 + 三层记忆检索
-│   ├── llm_client.py           # 豆包 VL ChatModel (OpenAI-compatible 封装)
-│   ├── gui_agent.py            # 🖥️ ReAct GUI Agent + MCP 客户端 + CDP 兜底
+│   ├── llm_client.py           # VL ChatModel (OpenAI-compatible 封装)
+│   ├── gui_agent.py            # ReAct GUI Agent + MCP 客户端 + CDP 兜底
 │   └── run_gui_agent.py        # GUI Agent 独立子进程 CLI 入口
 │
 ├── gui/                        # Qt 界面
@@ -339,12 +337,12 @@ AIRAG/
 │   ├── retrieval_ranker.py     # RRF 融合 + lightweight rerank 精排
 │   ├── gui_operation_memory.py # GUI 操作历史记忆
 │   ├── session_memory.py       # 会话记忆管理
-│   ├── app_control.py          # 🪟 Windows 应用发现/激活/启动 (40+ 应用)
-│   ├── direct_commands.py      # ⚡ 直达命令路由 (纯启动/切换绕过 Agent)
-│   ├── task_router.py          # 🔀 任务分类路由 (embedding 语义相似度)
-│   ├── risk_engine.py          # 🔒 风险评估引擎 (safe/high/critical)
-│   ├── audit_store.py          # 📋 审计日志存储 (JSONL + 线程安全)
-│   └── rollback.py             # ↩️ 回滚方案 + 替代操作建议
+│   ├── app_control.py          # Windows 应用发现/激活/启动 (40+ 应用)
+│   ├── direct_commands.py      # 直达命令路由 (纯启动/切换绕过 Agent)
+│   ├── task_router.py          # 任务分类路由 (embedding 语义相似度)
+│   ├── risk_engine.py          # 风险评估引擎 (safe/high/critical)
+│   ├── audit_store.py          # 审计日志存储 (JSONL + 线程安全)
+│   └── rollback.py             # 回滚方案 + 替代操作建议
 │
 ├── tests/                      # 测试套件
 │   ├── test_risk_engine.py

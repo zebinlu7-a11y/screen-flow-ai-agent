@@ -997,9 +997,30 @@ def _pyautogui_press(key: str):
     key = aliases.get(key, key)
     if "+" in key:
         keys = [aliases.get(k.strip(), k.strip()) for k in key.split("+")]
+
+        # ★ Win+L / Ctrl+Alt+Del 等系统级安全热键被 Windows 内核拦截，
+        #   SendInput 模拟无效，需要用 Native API 直接调用。
+        if set(keys) == {"win", "l"}:
+            _lock_workstation()
+            return
+
         pyautogui.hotkey(*keys)
     else:
         pyautogui.press(key)
+
+
+def _lock_workstation():
+    """调用 Windows LockWorkStation API 锁定屏幕。
+
+    Win+L 是 Secure Attention Sequence (SAS)，SendInput / pyautogui 无法模拟。
+    改用 user32.dll 的 LockWorkStation() 直接锁定。
+    """
+    import ctypes
+    try:
+        ctypes.windll.user32.LockWorkStation()
+        print("[Hotkey] LockWorkStation OK — 屏幕已锁定")
+    except Exception as exc:
+        print(f"[Hotkey] LockWorkStation 失败: {exc}")
 
 
 def _pyautogui_hotkey(key: str):

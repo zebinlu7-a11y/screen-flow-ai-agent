@@ -575,7 +575,7 @@ class ScreenAIAgent(QObject):
 
     # ============================================================
     # System Tray
-    # ============================================================
+    # ============================================================ 
 
     def _setup_tray(self):
         """创建系统托盘图标和右键菜单。"""
@@ -710,6 +710,11 @@ class ScreenAIAgent(QObject):
         try:
             if hasattr(self, '_key_listener') and self._key_listener:
                 self._key_listener.stop()
+        except Exception:
+            pass
+        # 删除「复制全部」保存的临时图片
+        try:
+            self._result_window.cleanup_clipboard_images()
         except Exception:
             pass
         self._tray.hide()
@@ -961,6 +966,12 @@ class ScreenAIAgent(QObject):
         # 避免重复打开截图窗口
         if self._capture_win is not None and self._capture_win.isVisible():
             return
+
+        # 新的一轮截图：删除上一轮「复制全部」保存的临时图片
+        try:
+            self._result_window.cleanup_clipboard_images()
+        except Exception:
+            pass
 
         # 截图时隐藏悬浮窗，避免它出现在截图中
         self._result_window.hide()

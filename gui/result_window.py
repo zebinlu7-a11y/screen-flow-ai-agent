@@ -57,6 +57,7 @@ class ResultWindow(QWidget):
         )
         self._pending_images: list = []    # 待发送图片 (base64 列表)
         self._pending_qimgs: list = []    # 待发送图片 (QImage 列表，供复制用)
+        self._clipboard_temp_dir = None    # 「复制全部」保存到磁盘的临时图片目录
         self._thumb_widgets: list = []    # 缩略图 widget 列表
 
         # ---- 拖动/缩放状态 ----
@@ -761,26 +762,108 @@ class ResultWindow(QWidget):
             self._copy_btn.hide()
 
     def _copy_images_to_clipboard(self):
-        """将所有待发送图片复制到剪贴板。"""
+        """复制待发送图片：单张直接复制图像，多张保存为文件后整体复制。"""
         if not self._pending_qimgs:
             return
         from PyQt6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         if len(self._pending_qimgs) == 1:
             clipboard.setImage(self._pending_qimgs[0])
-        else:
-            # 多张图：水平拼接
-            total_w = sum(img.width() for img in self._pending_qimgs) + (len(self._pending_qimgs) - 1) * 4
-            max_h = max(img.height() for img in self._pending_qimgs)
-            combined = QImage(total_w, max_h, QImage.Format.Format_ARGB32)
-            combined.fill(QColor(255, 255, 255))
-            p = QPainter(combined)
-            x = 0
-            for img in self._pending_qimgs:
-                p.drawImage(x, (max_h - img.height()) // 2, img)
-                x += img.width() + 4
-            p.end()
-            clipboard.setImage(combined)
+            return
+
+        # 多张图：保存为 PNG 文件 → 以文件列表整体复制（粘贴时可一次全部贴出）
+        import os
+        self.cleanup_clipboard_images()
+        base = os.path.join(self._app_data_dir(), ".airag_clipboard")
+        os.makedirs(base, exist_ok=True)
+        saved = []
+        for i, img in enumerate(self._pending_qimgs):
+            path = os.path.join(base, f"img_{i + 1}.png")
+            img.save(path, "PNG")
+            saved.append(path)
+        self._clipboard_temp_dir = base
+        self._copy_files_to_clipboard(saved)
+        print(f"[AIRAG] 已保存并复制 {len(saved)} 张图片到剪贴板: {base}")
+
+    @staticmethod
+    def _copy_files_to_clipboard(paths):
+        """把一组文件路径作为文件列表复制到剪贴板（Windows CF_HDROP）。"""
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # 声明返回/参数类型，避免 64 位句柄被截断
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+
+        CF_HDROP = 15
+        GMEM_MOVEABLE = 0x0002
+        GMEM_ZEROINIT = 0x0040
+
+        # DROPFILES: DWORD pFiles; LONG x; LONG y; BOOL fNC; BOOL fWide => 20 字节
+        dropfiles = struct.pack("IIiiI", 20, 0, 0, 0, 1)  # fWide=1 → Unicode 路径
+        file_list = "\x00".join(paths) + "\x00\x00"
+        payload = dropfiles + file_list.encode("utf-16-le")
+
+        if not user32.OpenClipboard(None):
+            return False
+        try:
+            user32.EmptyClipboard()
+            hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(payload))
+            if not hmem:
+                return False
+            try:
+                ptr = kernel32.GlobalLock(hmem)
+                if not ptr:
+                    return False
+                try:
+                    ctypes.memmove(ptr, payload, len(payload))
+                finally:
+                    kernel32.GlobalUnlock(hmem)
+                if not user32.SetClipboardData(CF_HDROP, hmem):
+                    return False
+                hmem = None  # 内存所有权已移交系统，不再手动释放
+                return True
+            finally:
+                if hmem:
+                    kernel32.GlobalFree(hmem)
+        finally:
+            user32.CloseClipboard()
+
+    @staticmethod
+    def _app_data_dir():
+        """可写的应用目录：打包后为 exe 所在目录，开发时为项目根目录。"""
+        import os
+        import sys
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def cleanup_clipboard_images(self):
+        """删除上次「复制全部」保存到磁盘的临时图片（退出 / 下一轮截图前调用）。"""
+        import shutil
+        d = getattr(self, "_clipboard_temp_dir", None)
+        if d:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+            self._clipboard_temp_dir = None
 
     def get_pending_images(self) -> list:
         """获取所有待发送图片的 base64 列表。"""
